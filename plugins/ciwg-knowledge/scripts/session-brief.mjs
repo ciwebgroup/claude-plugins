@@ -1,15 +1,20 @@
 /**
  * SessionStart hook — client brief on session open.
  *
- * Only fires in repos that carry a .ciwg-client.json mapping with a
- * clientName: injects a handful of the most relevant recent knowledge hits
- * for that client (meetings, tickets, notes) so the session starts already
- * oriented. Unmapped repos get nothing — no org-wide noise.
+ * Fires only in repos whose .ciwg-client.json carries BOTH an
+ * organizationId and a clientName: the org id server-side-filters the
+ * search (a name-only lexical match can surface OTHER clients' data), and
+ * the name is the query seed. Unmapped repos get nothing — no org-wide
+ * noise. Fires on real startup/resume only, never after compaction.
  *
  * Same fail-open discipline as inject-context: any failure exits 0 silent.
  */
 
 import {
+    TRUST_PREAMBLE,
+    debug,
+    emitAndExit,
+    escapeXml,
     getClientMapping,
     readStdin,
     renderHits,
@@ -18,8 +23,14 @@ import {
 
 try {
     const payload = JSON.parse(await readStdin())
+    if (payload.source === "compact" || payload.source === "clear") {
+        process.exit(0)
+    }
     const mapping = getClientMapping(payload.cwd)
-    if (!mapping?.clientName) process.exit(0)
+    if (!mapping?.clientName || !mapping.organizationId) {
+        debug("no complete client mapping (need organizationId + clientName)")
+        process.exit(0)
+    }
 
     const result = await searchKnowledge({
         q: mapping.clientName,
@@ -27,25 +38,23 @@ try {
         limit: 5,
         minScore: 0.2,
     })
-    const hits = result?.hits ?? []
+    if (!result.ok) process.exit(0)
+    const hits = result.data?.hits ?? []
     if (hits.length === 0) process.exit(0)
 
     const rendered = renderHits(hits, { maxChars: 1800, maxHits: 5 })
     if (!rendered) process.exit(0)
 
-    process.stdout.write(
-        JSON.stringify({
-            hookSpecificOutput: {
-                hookEventName: "SessionStart",
-                additionalContext:
-                    `<company-knowledge client="${mapping.clientName}" auto-retrieved="true">\n` +
-                    `Recent internal context for this client (cite sources when ` +
-                    `used; verify before asserting as current):\n${rendered}\n` +
-                    `</company-knowledge>`,
-            },
-        })
-    )
-    process.exit(0)
-} catch {
+    emitAndExit({
+        hookSpecificOutput: {
+            hookEventName: "SessionStart",
+            additionalContext:
+                `<company-knowledge client="${escapeXml(mapping.clientName)}" auto-retrieved="true">\n` +
+                `${TRUST_PREAMBLE}\n${rendered}\n` +
+                `</company-knowledge>`,
+        },
+    })
+} catch (error) {
+    debug("hook error:", error?.message)
     process.exit(0)
 }
