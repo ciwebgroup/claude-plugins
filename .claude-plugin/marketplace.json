@@ -1,0 +1,14 @@
+{
+    "name": "ciwg",
+    "owner": {
+        "name": "CI Web Group",
+        "email": "braedn@ciwebgroup.com"
+    },
+    "plugins": [
+        {
+            "name": "ciwg-knowledge",
+            "source": "./plugins/ciwg-knowledge",
+            "description": "Company knowledge auto-injection: relevant meetings, tickets, chat and notes flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Includes explicit MCP search tools for deep dives."
+        }
+    ]
+}
