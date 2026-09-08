@@ -8,7 +8,7 @@
         {
             "name": "ciwg-knowledge",
             "source": "./plugins/ciwg-knowledge",
-            "description": "Company knowledge auto-injection: relevant meetings, tickets, chat and notes flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Includes explicit MCP search tools for deep dives."
+            "description": "Company knowledge auto-injection: relevant call transcripts, chat logs and Fathom meetings (tickets/team-chat/notes as their ingestion ships) flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Includes explicit MCP search tools."
         }
     ]
 }

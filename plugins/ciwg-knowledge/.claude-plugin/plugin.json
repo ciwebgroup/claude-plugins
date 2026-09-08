@@ -1,0 +1,15 @@
+{
+    "name": "ciwg-knowledge",
+    "version": "0.1.0",
+    "description": "CIWG company-knowledge auto-injection. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. MCP tools included for explicit deep dives.",
+    "author": {
+        "name": "CI Web Group"
+    },
+    "hooks": "./hooks/hooks.json",
+    "mcpServers": {
+        "ciwg-knowledge": {
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/knowledge-mcp.mjs"]
+        }
+    }
+}
