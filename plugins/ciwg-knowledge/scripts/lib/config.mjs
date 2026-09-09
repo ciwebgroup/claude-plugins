@@ -284,7 +284,11 @@ export function renderEngramLines(
                     : `${Math.round(minutes / 60)}h ago`
             stamp = ` ${clock} UTC, ${ago}`
         }
-        const line = `- [engram${stamp}] ${clip(summary.replace(/\s+/g, " "), 220)}`
+        // escapeXml AFTER clip: the body renders inside the
+        // <company-knowledge> wrapper, and server-stored text is untrusted
+        // here regardless of server-side sanitization — an unescaped
+        // "</company-knowledge>" would break out of the framing.
+        const line = `- [engram${stamp}] ${escapeXml(clip(summary.replace(/\s+/g, " "), 220))}`
         if (used + line.length > maxChars) break
         lines.push(line)
         used += line.length
@@ -322,7 +326,15 @@ export function emitAndExit(payload) {
     process.stdout.write(JSON.stringify(payload), () => process.exit(0))
 }
 
-const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+/** UTF-16 clamp with ellipsis; never leaves a dangling high surrogate (a
+ * clip must not split an astral code point — emoji — in half). */
+const clip = (s, n) => {
+    if (s.length <= n) return s
+    let cut = s.slice(0, n - 1)
+    const last = cut.charCodeAt(cut.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1)
+    return `${cut}…`
+}
 
 /** Compact, citation-first rendering of hits for context injection.
  * Defensive about shapes — a malformed hit is skipped, never thrown on. */
@@ -338,7 +350,10 @@ export function renderHits(hits, { maxChars = 1500, maxHits = 3 } = {}) {
             typeof hit.score === "number" ? hit.score.toFixed(2) : "?"
         const source = `${hit.sourceType}:${hit.sourceId}#${hit.chunkIndex}`
         const org = hit.organizationId != null ? ` org:${hit.organizationId}` : ""
-        const line = `- [${source}${org} score:${score}] ${clip(bodyRaw.replace(/\s+/g, " "), 420)}`
+        // Same wrapper, same risk as renderEngramLines: knowledge content
+        // (and source pointers) are untrusted — escape so nothing can close
+        // the <company-knowledge> framing early.
+        const line = `- [${escapeXml(source)}${org} score:${score}] ${escapeXml(clip(bodyRaw.replace(/\s+/g, " "), 420))}`
         if (used + line.length > maxChars) break
         lines.push(line)
         used += line.length
