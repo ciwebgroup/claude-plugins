@@ -1,7 +1,7 @@
 {
     "name": "ciwg-knowledge",
-    "version": "0.1.0",
-    "description": "CIWG company-knowledge auto-injection. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. MCP tools included for explicit deep dives.",
+    "version": "0.2.0",
+    "description": "CIWG company-knowledge auto-injection. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. Sign in once with CIWG SSO (/ciwg-login); no API tokens. MCP tools included for explicit deep dives, on the same sign-in.",
     "author": {
         "name": "CI Web Group"
     },

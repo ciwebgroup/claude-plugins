@@ -1,5 +1,16 @@
 /**
- * SessionStart hook — client brief + today's team activity on session open.
+ * SessionStart hook — sign-in nudge, client brief, today's team activity.
+ *
+ * Sign-in nudge (first thing, before any API call):
+ *   - never signed in (no SSO cache, no legacy token) → ONE line asking
+ *     the user to run /ciwg-login, at most once a day, then nothing else;
+ *   - SSO refresh rejected (revoked / expired) → the same kind of line,
+ *     once per session;
+ *   - the API rejected the SSO token (401) → an actionable line, once per
+ *     session (the server may not trust this app yet).
+ *
+ * Proactive refresh: a token that expires within 5 minutes is refreshed
+ * here, at session start, so the per-prompt hooks never pay for it.
  *
  * Knowledge brief: fires only in repos whose .ciwg-client.json carries BOTH
  * an organizationId and a clientName: the org id server-side-filters the
@@ -13,49 +24,85 @@
  * Fires on real startup/resume only, never after compaction.
  *
  * Same fail-open discipline as inject-context: any failure exits 0 silent.
+ * Every call is bounded by the hook deadline (hooks.json timeout).
  */
 
+import { signInHint } from "./lib/auth.mjs"
 import {
     TRUST_PREAMBLE,
     debug,
-    emitAndExit,
+    emit,
     escapeXml,
     getClientMapping,
+    hookDeadline,
     listEngramActivities,
     readStdin,
     renderEngramLines,
     renderHits,
+    resolveCredential,
     searchKnowledge,
 } from "./lib/config.mjs"
 import { detectRepoName } from "./lib/engram.mjs"
+
+const PROACTIVE_REFRESH_MS = 5 * 60_000
+
+async function hint(additionalContext) {
+    await emit({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext },
+    })
+    process.exit(0)
+}
 
 try {
     const payload = JSON.parse(await readStdin())
     if (payload.source === "compact" || payload.source === "clear") {
         process.exit(0)
     }
+    const deadline = hookDeadline()
+
+    // Resolves the credential once (a silent — possibly proactive — refresh
+    // if needed); the API calls below share the memoised result.
+    const auth = await resolveCredential({ deadline, refreshWithinMs: PROACTIVE_REFRESH_MS })
+    if (!auth.ok) {
+        const text = signInHint(auth.status, payload.session_id)
+        if (text) await hint(text)
+        debug("no usable credential:", auth.status)
+        process.exit(0)
+    }
+
     const mapping = getClientMapping(payload.cwd)
     const hasFullMapping = Boolean(
         mapping?.clientName && mapping.organizationId
     )
     const repoName =
-        mapping?.organizationId != null ? null : detectRepoName(payload.cwd)
+        mapping?.organizationId != null ? null : detectRepoName(payload.cwd, { deadline })
 
     const [knowledge, engram] = await Promise.all([
         hasFullMapping
-            ? searchKnowledge({
-                  q: mapping.clientName,
-                  organizationId: mapping.organizationId,
-                  limit: 5,
-                  minScore: 0.2,
-              })
+            ? searchKnowledge(
+                  {
+                      q: mapping.clientName,
+                      organizationId: mapping.organizationId,
+                      limit: 5,
+                      minScore: 0.2,
+                  },
+                  { deadline }
+              )
             : Promise.resolve(null),
-        listEngramActivities({
-            organizationId: mapping?.organizationId,
-            repo: repoName,
-            limit: 5,
-        }),
+        listEngramActivities(
+            {
+                organizationId: mapping?.organizationId,
+                repo: repoName,
+                limit: 5,
+            },
+            { deadline }
+        ),
     ])
+
+    if (knowledge?.status === "api-rejected" || engram.status === "api-rejected") {
+        const text = signInHint("api-rejected", payload.session_id)
+        if (text) await hint(text)
+    }
 
     const renderedHits =
         knowledge?.ok && knowledge.data?.hits?.length
@@ -80,7 +127,7 @@ try {
     const clientAttr = hasFullMapping
         ? ` client="${escapeXml(mapping.clientName)}"`
         : ""
-    emitAndExit({
+    await emit({
         hookSpecificOutput: {
             hookEventName: "SessionStart",
             additionalContext:
@@ -89,6 +136,7 @@ try {
                 `</company-knowledge>`,
         },
     })
+    process.exit(0)
 } catch (error) {
     debug("hook error:", error?.message)
     process.exit(0)

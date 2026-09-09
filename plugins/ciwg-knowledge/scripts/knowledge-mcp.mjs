@@ -1,7 +1,15 @@
 /**
- * ciwg-knowledge MCP server — the EXPLICIT retrieval surface (the hooks are
- * the automatic one). Raw newline-delimited JSON-RPC over stdio; no SDK
- * dependency so the plugin needs no install step.
+ * ciwg-knowledge MCP server (stdio) — the plugin's explicit retrieval
+ * surface, registered by plugin.json. It wraps the knowledge REST API with
+ * the SAME credential the hooks use (the /ciwg-login SSO cache, or a
+ * legacy token), so one sign-in covers hooks and tools alike.
+ *
+ * The remote connector (https://api.ciwebgroup.com/mcp, native OAuth) is
+ * the claude.ai / Claude Desktop path; Claude Code users who prefer it can
+ * add it by hand — see the README.
+ *
+ * Raw newline-delimited JSON-RPC over stdio; no SDK dependency so the
+ * plugin needs no install step.
  *
  * Tools:
  *   search_company_knowledge  — semantic search over ingested company
@@ -11,12 +19,22 @@
  */
 
 import { createInterface } from "node:readline"
-import {
-    API_BASE,
-    describeFailure,
-    getToken,
-    searchKnowledge,
-} from "./lib/config.mjs"
+import { describeFailure, getSourceArtifacts, searchKnowledge } from "./lib/config.mjs"
+
+/**
+ * A human is waiting on a tool call, not a hook timer: the API call itself
+ * may take up to 8 s, and the WHOLE exchange — lock wait, a silent refresh,
+ * persisting a rotated token, the API call — is bounded by a 12 s deadline
+ * (without one the worst case is lock 5 s + refresh 4 s + persist 0.65 s +
+ * API 8 s ≈ 17.7 s). 12 s rather than 10 s so the common refresh-then-call
+ * case still gives the API its full 8 s.
+ */
+const TOOL_TIMEOUT_MS = 8_000
+const TOOL_DEADLINE_MS = 12_000
+const toolOpts = () => ({
+    timeoutMs: TOOL_TIMEOUT_MS,
+    deadline: Date.now() + TOOL_DEADLINE_MS,
+})
 
 const TOOLS = [
     {
@@ -87,7 +105,7 @@ async function callTool(name, args) {
                         : undefined,
                 limit: clampInt(args.limit, 1, 20),
             },
-            8000
+            toolOpts()
         )
         if (!result.ok) return errText(describeFailure(result.status))
         const hits = (result.data.hits ?? []).map((h) => ({
@@ -101,27 +119,12 @@ async function callTool(name, args) {
         return text(JSON.stringify({ mode: result.data.mode, hits }, null, 2))
     }
     if (name === "get_source_artifacts") {
-        const token = getToken()
-        if (!token) return errText(describeFailure("no-token"))
-        const url = new URL(`${API_BASE}/api/v1/knowledge/artifacts`)
-        url.searchParams.set("source_type", String(args.source_type ?? ""))
-        url.searchParams.set("source_id", String(args.source_id ?? ""))
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 8000)
-        try {
-            const res = await fetch(url, {
-                headers: { "X-API-Token": token },
-                signal: controller.signal,
-            })
-            if (!res.ok) return errText(describeFailure(res.status))
-            return text(JSON.stringify(await res.json(), null, 2))
-        } catch {
-            // Never surface error.message here — a header-illegal token
-            // value would be echoed back into the transcript by Node.
-            return errText(describeFailure("network"))
-        } finally {
-            clearTimeout(timer)
-        }
+        const result = await getSourceArtifacts(
+            { sourceType: args.source_type, sourceId: args.source_id },
+            toolOpts()
+        )
+        if (!result.ok) return errText(describeFailure(result.status))
+        return text(JSON.stringify(result.data, null, 2))
     }
     return errText(`Unknown tool "${name}"`)
 }
@@ -140,7 +143,7 @@ rl.on("line", async (line) => {
             reply(id, {
                 protocolVersion: "2024-11-05",
                 capabilities: { tools: {} },
-                serverInfo: { name: "ciwg-knowledge", version: "0.1.0" },
+                serverInfo: { name: "ciwg-knowledge", version: "0.2.0" },
             })
         } else if (method === "ping") {
             reply(id, {})

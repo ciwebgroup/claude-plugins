@@ -1,9 +1,10 @@
 /**
  * Engram hook tests — digest construction against a real throwaway git
  * repo, the opt-out switches, the no-token fail-open, and the injection
- * rendering. Run from the repo root (or anywhere):
+ * rendering. Run from the repo root (pass the files — the directory form
+ * is not supported by every Node):
  *
- *   node --test plugins/ciwg-knowledge/tests/
+ *   node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs
  *
  * No network is touched: the only API-path test asserts the no-token
  * short-circuit. HOME/USERPROFILE are pointed at a throwaway dir so the
@@ -98,6 +99,20 @@ test("collectGitFacts: branch, status counts, top paths, shortstat", () => {
     assert.equal(facts.filesChanged, 2)
     assert.deepEqual([...facts.topPaths].sort(), ["a.txt", "b.txt"])
     assert.ok(facts.insertions >= 2, `insertions: ${facts.insertions}`)
+})
+
+test("git facts are bounded by the hook deadline: a spent budget skips the git calls instead of starting them", () => {
+    // Plenty of time: the usual facts.
+    assert.equal(detectRepoName(repoDir, { deadline: Date.now() + 10_000 }), "acme-hvac")
+    assert.equal(collectGitFacts(repoDir, { deadline: Date.now() + 10_000 }).branch, "checkout-fix")
+    // Not enough left for a git call AND the POST that follows: nothing is
+    // spawned, so the digest has no repo anchor and the hook exits quietly.
+    const spent = Date.now() + 1_000
+    const t0 = Date.now()
+    assert.equal(detectRepoName(repoDir, { deadline: spent }), null)
+    assert.deepEqual(collectGitFacts(repoDir, { deadline: spent }), {})
+    assert.equal(buildEngramDigest({ cwd: repoDir, deadline: spent }), null)
+    assert.ok(Date.now() - t0 < 200, "skipped calls cost nothing")
 })
 
 test("buildEngramDigest: structured facts only, from git + mapping", () => {

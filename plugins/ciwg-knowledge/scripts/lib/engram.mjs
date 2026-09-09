@@ -14,19 +14,37 @@ import { execFileSync } from "node:child_process"
 import { statSync } from "node:fs"
 import { basename } from "node:path"
 import { debug, getClientMapping } from "./config.mjs"
+import { remainingMs } from "./paths.mjs"
 
 const GIT_TIMEOUT_MS = 1500
+/** Kept back from the hook deadline for what FOLLOWS the git facts: a
+ * refresh worth starting plus the API reserve (auth.mjs MIN_HTTP_MS +
+ * API_RESERVE_MS), with slack. Four git calls at 1.5 s each would
+ * otherwise eat the whole 5 s hook budget before the POST began. */
+const POST_RESERVE_MS = 2_500
+/** Below this, a git call is not worth spawning. */
+const MIN_GIT_MS = 100
 const TOP_PATHS_MAX = 5
 const PATH_MAX_CHARS = 200
 
+/** How long one git call may take: its own cap, or what the deadline
+ * leaves after the reserve — whichever is smaller (no deadline → the cap). */
+const gitBudget = (deadline) =>
+    Math.min(GIT_TIMEOUT_MS, remainingMs(deadline) - POST_RESERVE_MS)
+
 /** Run one git command; RAW stdout (porcelain status is column-sensitive —
  * a global trim would eat the first line's leading status space), or null
- * on ANY failure (no git, not a repo, timeout). */
-function git(cwd, args) {
+ * on ANY failure (no git, not a repo, timeout, budget exhausted). */
+function git(cwd, args, deadline) {
+    const timeout = gitBudget(deadline)
+    if (timeout < MIN_GIT_MS) {
+        debug("git", args[0], "skipped: hook budget exhausted")
+        return null
+    }
     try {
         return execFileSync("git", args, {
             cwd,
-            timeout: GIT_TIMEOUT_MS,
+            timeout,
             encoding: "utf8",
             stdio: ["ignore", "pipe", "ignore"],
             windowsHide: true,
@@ -41,11 +59,12 @@ function git(cwd, args) {
  * Repo identity = basename of the git toplevel, or null outside a git repo.
  * Deliberately NOT a cwd-basename fallback: posts from scratch directories
  * would mint noise "repos", and read-side filters must match what writers
- * posted. Writers and readers both call this.
+ * posted. Writers and readers both call this. `deadline` (absolute ms)
+ * bounds the git call to what the hook budget leaves.
  */
-export function detectRepoName(cwd) {
+export function detectRepoName(cwd, { deadline } = {}) {
     if (!cwd) return null
-    const toplevel = git(cwd, ["rev-parse", "--show-toplevel"])?.trim()
+    const toplevel = git(cwd, ["rev-parse", "--show-toplevel"], deadline)?.trim()
     return toplevel ? basename(toplevel) : null
 }
 
@@ -57,14 +76,15 @@ function statusLinePath(line) {
     return chosen.replace(/^"|"$/g, "").slice(0, PATH_MAX_CHARS)
 }
 
-/** Cheap git facts: current status counts + working-tree shortstat. */
-export function collectGitFacts(cwd) {
+/** Cheap git facts: current status counts + working-tree shortstat. Each
+ * call is bounded by what `deadline` leaves (see gitBudget). */
+export function collectGitFacts(cwd, { deadline } = {}) {
     const facts = {}
-    const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])?.trim()
+    const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], deadline)?.trim()
     // Detached HEAD reports the literal string "HEAD" — not a branch name.
     if (branch && branch !== "HEAD") facts.branch = branch.slice(0, 200)
 
-    const status = git(cwd, ["status", "--porcelain"])
+    const status = git(cwd, ["status", "--porcelain"], deadline)
     if (status !== null) {
         const lines = status
             .split("\n")
@@ -78,7 +98,7 @@ export function collectGitFacts(cwd) {
         if (topPaths.length > 0) facts.topPaths = topPaths
     }
 
-    const shortstat = git(cwd, ["diff", "--shortstat", "HEAD"])
+    const shortstat = git(cwd, ["diff", "--shortstat", "HEAD"], deadline)
     if (shortstat) {
         const insertions = /(\d+) insertion/.exec(shortstat)
         const deletions = /(\d+) deletion/.exec(shortstat)
@@ -114,16 +134,18 @@ export function deriveDurationMinutes(transcriptPath, nowMs = Date.now()) {
  * the session has no anchor (no git repo AND no client mapping — the server
  * relevance gate would reject it) or is trivial (no changes and under two
  * minutes — a session that opened and closed is not team signal).
+ * `deadline` (absolute ms, the hook's) bounds the git work so the POST
+ * that follows still fits.
  */
-export function buildEngramDigest({ cwd, transcriptPath, now = new Date() }) {
-    const repo = detectRepoName(cwd)
+export function buildEngramDigest({ cwd, transcriptPath, now = new Date(), deadline }) {
+    const repo = detectRepoName(cwd, { deadline })
     const mapping = getClientMapping(cwd)
     if (!repo && mapping?.organizationId == null) {
         debug("no repo and no client mapping — skipping engram post")
         return null
     }
 
-    const facts = repo ? collectGitFacts(cwd) : {}
+    const facts = repo ? collectGitFacts(cwd, { deadline }) : {}
     const durationMinutes = deriveDurationMinutes(
         transcriptPath,
         now.getTime()
