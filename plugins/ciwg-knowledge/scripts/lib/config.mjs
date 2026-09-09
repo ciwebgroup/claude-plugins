@@ -164,6 +164,134 @@ export async function searchKnowledge(
     }
 }
 
+/**
+ * Engram opt-out: env CIWG_ENGRAM=off (also 0/false) or `"engram": false`
+ * in ~/.ciwg/knowledge.json stops the SessionEnd hook from POSTING activity
+ * digests. Read-side injection is unaffected — the opt-out is about not
+ * publishing your own activity.
+ */
+export function isEngramOptedOut() {
+    const env = (process.env.CIWG_ENGRAM || "").trim().toLowerCase()
+    if (env === "off" || env === "0" || env === "false") return true
+    try {
+        const parsed = JSON.parse(
+            stripBom(
+                readFileSync(join(homedir(), ".ciwg", "knowledge.json"), "utf8")
+            )
+        )
+        if (parsed.engram === false) return true
+    } catch (error) {
+        debug("knowledge config unreadable for engram opt-out:", error.message)
+    }
+    return false
+}
+
+/** Shared request core for the engram endpoints — same token / 60s-backoff /
+ * mark-down discipline as searchKnowledge. */
+async function engramRequest(url, init, timeoutMs) {
+    const token = getToken()
+    if (!token) return { ok: false, status: "no-token" }
+    if (isBackedOff()) {
+        debug("skipping engram call (recent network failure)")
+        return { ok: false, status: "backoff" }
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+        const res = await fetch(url, {
+            ...init,
+            headers: { "X-API-Token": token, ...(init.headers || {}) },
+            signal: controller.signal,
+        })
+        if (!res.ok) {
+            debug(`engram HTTP ${res.status}`)
+            return { ok: false, status: res.status }
+        }
+        return { ok: true, data: await res.json() }
+    } catch (error) {
+        debug("engram network failure:", error.message)
+        markDown()
+        return { ok: false, status: "network" }
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+/**
+ * POST /api/v1/engram/activities — publish one STRUCTURED activity digest
+ * (structured facts only; the server whitelists keys and clamps lengths).
+ */
+export async function postEngramActivity(digest, timeoutMs = 4000) {
+    return engramRequest(
+        `${API_BASE}/api/v1/engram/activities`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(digest),
+        },
+        timeoutMs
+    )
+}
+
+/**
+ * GET /api/v1/engram/activities — today's team activity, org- or
+ * repo-filtered. Callers must pass at least one filter; an unfiltered read
+ * would inject unrelated team activity into every session.
+ */
+export async function listEngramActivities(
+    { organizationId, repo, limit } = {},
+    timeoutMs = 3000
+) {
+    if (organizationId == null && !repo) {
+        return { ok: false, status: "no-scope" }
+    }
+    const url = new URL(`${API_BASE}/api/v1/engram/activities`)
+    if (organizationId != null) {
+        url.searchParams.set("organization_id", String(organizationId))
+    } else {
+        url.searchParams.set("repo", String(repo).slice(0, 200))
+    }
+    if (limit != null) url.searchParams.set("limit", String(limit))
+    return engramRequest(url, { method: "GET" }, timeoutMs)
+}
+
+/**
+ * Compact rendering of engram activities for context injection — one line
+ * per activity, oldest first, hard char budget so team activity stays
+ * SECONDARY to knowledge snippets. Defensive about shapes: a malformed
+ * activity is skipped, never thrown on.
+ */
+export function renderEngramLines(
+    activities,
+    { maxChars = 600, maxLines = 5, now = Date.now() } = {}
+) {
+    if (!Array.isArray(activities)) return ""
+    const lines = []
+    let used = 0
+    // The API returns newest first; a brief reads better chronologically.
+    for (const activity of [...activities.slice(0, maxLines)].reverse()) {
+        const summary =
+            typeof activity?.summary === "string" ? activity.summary.trim() : ""
+        if (!summary) continue
+        const createdMs = Date.parse(activity.createdAt)
+        let stamp = ""
+        if (!Number.isNaN(createdMs)) {
+            const clock = new Date(createdMs).toISOString().slice(11, 16)
+            const minutes = Math.max(0, Math.round((now - createdMs) / 60_000))
+            const ago =
+                minutes < 60
+                    ? `${minutes}m ago`
+                    : `${Math.round(minutes / 60)}h ago`
+            stamp = ` ${clock} UTC, ${ago}`
+        }
+        const line = `- [engram${stamp}] ${clip(summary.replace(/\s+/g, " "), 220)}`
+        if (used + line.length > maxChars) break
+        lines.push(line)
+        used += line.length
+    }
+    return lines.join("\n")
+}
+
 /** Human-actionable line for a searchKnowledge failure status. */
 export function describeFailure(status) {
     if (status === "no-token") {
