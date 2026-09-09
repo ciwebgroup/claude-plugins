@@ -62,15 +62,16 @@ const normalizeIssuer = (s) => String(s).trim().replace(/\/*$/, "/")
 /** One Authentik application on the CIWG SSO instance
  * (https://sso.ciwgserver.com) serves everything (claude.ai connector, the
  * plugin's login, the optional native Claude Code OAuth): its slug is the
- * issuer path and its client id is `ciwg-knowledge`. Env-overridable for
- * staging/local IdPs — and for the day the slug differs from this default
- * (the README says how to read the exact issuer off the provider page). */
+ * issuer path; its client id is the opaque string Authentik generated when
+ * the provider was created (it is NOT the slug). Env-overridable for
+ * staging/local IdPs — and for the day the slug or client id differs from
+ * these defaults (the README says how to read both off the provider page). */
 const OIDC_ISSUER = normalizeIssuer(
     process.env.CIWG_OIDC_ISSUER ||
         "https://sso.ciwgserver.com/application/o/ciwg-knowledge/"
 )
 export const OIDC_CLIENT_ID = (
-    process.env.CIWG_OIDC_CLIENT_ID || "ciwg-knowledge"
+    process.env.CIWG_OIDC_CLIENT_ID || "lVCIMgCq4SQiQAdqHUfg7UONaOISMbpHygQXcIe1"
 ).trim()
 export const OIDC_SCOPES = "openid profile email groups offline_access"
 
