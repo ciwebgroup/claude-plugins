@@ -1,18 +1,21 @@
 /**
  * SSO sign-in tests — PKCE, the token cache + silent refresh (mocked token
- * endpoint), expiry, legacy-token precedence, the loopback and device
- * flows end to end, logout, the hint markers, and the hooks' one-line
- * sign-in nudges (real hook processes, no network). Run:
+ * endpoint), expiry, the hook time budget, legacy-token precedence, the
+ * loopback and device flows end to end, logout, the hint cadence, and the
+ * hooks' one-line sign-in nudges (real hook processes, no network). Run
+ * from the repo root (pass the files — the directory form is not
+ * supported by every Node):
  *
- *   node --test plugins/ciwg-knowledge/tests/
+ *   node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs
  *
  * HOME/USERPROFILE point at a throwaway dir so the user's real ~/.ciwg is
  * never read or written; every network call goes through an injected
- * `fetchImpl` — nothing dials out.
+ * `fetchImpl` — nothing dials out (the one "IdP" in here is a 127.0.0.1
+ * server the SSH test owns).
  */
 
 import assert from "node:assert/strict"
-import { execFile, execFileSync } from "node:child_process"
+import { execFile, execFileSync, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
     existsSync,
@@ -24,7 +27,7 @@ import {
     utimesSync,
     writeFileSync,
 } from "node:fs"
-import { get as httpGet } from "node:http"
+import { createServer, get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { after, beforeEach, test } from "node:test"
@@ -45,29 +48,44 @@ delete process.env.CIWG_KNOWLEDGE_TOKEN
 process.env.CIWG_KNOWLEDGE_URL = "http://127.0.0.1:9"
 
 const auth = await import("../scripts/lib/auth.mjs")
-const { describeFailure } = await import("../scripts/lib/config.mjs")
+const config = await import("../scripts/lib/config.mjs")
+const { readState, updateState } = await import("../scripts/lib/state.mjs")
 const {
+    LEGACY_TOKEN_NOTE,
     OIDC_CLIENT_ID,
     OIDC_SCOPES,
+    TIMING,
     authPath,
+    browserLaunchSpec,
     decodeJwtPayload,
+    describeAuthStatus,
     discover,
     finishDeviceLogin,
-    firstRunHintDue,
     generatePkce,
     getAccessToken,
     getLegacyToken,
     loginWithBrowser,
     loginWithDeviceCode,
     logout,
+    persistAuth,
     readAuth,
-    reloginHintDue,
     resolveAuth,
+    signInHint,
+    startLoopbackListener,
     writeAuth,
 } = auth
+const {
+    HOOK_BUDGET_MS,
+    describeFailure,
+    getSourceArtifacts,
+    resetCredentialMemo,
+    searchKnowledge,
+} = config
 
-const scriptsDir = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts")
+const pluginDir = join(dirname(fileURLToPath(import.meta.url)), "..")
+const scriptsDir = join(pluginDir, "scripts")
 const ciwgDir = join(fakeHome, ".ciwg")
+const statePath = join(ciwgDir, "state.json")
 const ISSUER = "https://sso.example.test/application/o/ciwg-knowledge/"
 const META = {
     issuer: ISSUER,
@@ -76,6 +94,8 @@ const META = {
     device_authorization_endpoint: "https://sso.example.test/application/o/device/",
     revocation_endpoint: "https://sso.example.test/application/o/revoke/",
 }
+const SEARCH_URL = "http://127.0.0.1:9/api/v1/knowledge/search"
+const ARTIFACTS_URL = "http://127.0.0.1:9/api/v1/knowledge/artifacts"
 
 const b64url = (value) =>
     Buffer.from(typeof value === "string" ? value : JSON.stringify(value)).toString("base64url")
@@ -86,21 +106,30 @@ const json = (body, status = 200) =>
         headers: { "content-type": "application/json" },
     })
 const sha256url = (s) => createHash("sha256").update(s).digest("base64url")
+const noSleep = async () => {}
 
-/** Records every call; routes by URL. `handlers` maps URL → fn(params, init). */
+/** Records every call; routes by URL prefix (query strings ignored).
+ * `handlers` maps URL → fn(params, init, callNo). */
 function mockFetch(handlers) {
     const calls = []
     const impl = async (url, init = {}) => {
         const key = String(url)
         const params = new URLSearchParams(init.body ?? "")
         calls.push({ url: key, method: init.method ?? "GET", params, headers: init.headers ?? {} })
-        const handler = handlers[key]
+        const handler = handlers[key] ?? handlers[key.split("?")[0]]
         if (!handler) throw new TypeError(`fetch failed: unexpected ${key}`)
         return handler(params, init, calls.length)
     }
     impl.calls = calls
     return impl
 }
+
+/** A handler that never answers — but honours the abort signal, exactly
+ * like undici does when fetchWithTimeout gives up. */
+const hang = (params, init) =>
+    new Promise((_, reject) => {
+        init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+    })
 
 const discoveryHandlers = () => ({
     [`${ISSUER}.well-known/openid-configuration`]: () => json(META),
@@ -109,7 +138,6 @@ const discoveryHandlers = () => ({
 /** A signed-in cache whose access token expired `expiredForMs` ago. */
 const seedAuth = (overrides = {}) =>
     writeAuth({
-        issuer: ISSUER,
         client_id: OIDC_CLIENT_ID,
         token_endpoint: META.token_endpoint,
         revocation_endpoint: META.revocation_endpoint,
@@ -117,9 +145,15 @@ const seedAuth = (overrides = {}) =>
         expires_at: Date.now() - 1000,
         refresh_token: "refresh-1",
         email: "ada@ciwebgroup.com",
-        obtained_at: Date.now() - 3600_000,
         ...overrides,
     })
+
+const seedFresh = (overrides = {}) =>
+    seedAuth({ access_token: "fresh", expires_at: Date.now() + 10 * 60_000, ...overrides })
+
+/** A dropped sign-in (what an invalid_grant leaves behind). */
+const seedRelogin = (email = "ada@ciwebgroup.com") =>
+    updateState({ relogin_at: Date.now(), relogin_email: email, relogin_why: "test" })
 
 after(() => {
     for (const [key, value] of Object.entries(savedEnv)) {
@@ -132,6 +166,7 @@ after(() => {
 beforeEach(() => {
     delete process.env.CIWG_KNOWLEDGE_TOKEN
     rmSync(ciwgDir, { recursive: true, force: true })
+    resetCredentialMemo()
 })
 
 // ------------------------------------------------------------------ PKCE
@@ -173,7 +208,7 @@ test("discover: reads the issuer's openid-configuration, validates endpoints", a
 
 // --------------------------------------------------------- token cache
 
-test("cache: writeAuth is owner-only and readAuth round-trips", () => {
+test("cache: writeAuth is owner-only and readAuth round-trips; the state file shares the 0700 dir", () => {
     seedAuth()
     const stored = readAuth()
     assert.equal(stored.version, 1)
@@ -184,10 +219,18 @@ test("cache: writeAuth is owner-only and readAuth round-trips", () => {
     }
     writeFileSync(authPath(), JSON.stringify({ version: 99, access_token: "x" }))
     assert.equal(readAuth(), null, "unknown version is ignored")
+
+    // The state file is created through the same ensureCiwgDir path.
+    rmSync(ciwgDir, { recursive: true, force: true })
+    updateState({ first_run_hint_at: 1 })
+    assert.deepEqual(readState(), { first_run_hint_at: 1 })
+    if (process.platform !== "win32") {
+        assert.equal(statSync(ciwgDir).mode & 0o777, 0o700)
+    }
 })
 
 test("getAccessToken: a fresh cached token is used without any network", async () => {
-    seedAuth({ access_token: "fresh", expires_at: Date.now() + 10 * 60_000 })
+    seedFresh()
     const fetchImpl = mockFetch({})
     const result = await getAccessToken({ fetchImpl })
     assert.equal(result.token, "fresh")
@@ -205,7 +248,7 @@ test("getAccessToken: a token inside the 30s skew window counts as expired", asy
     assert.equal(fetchImpl.calls.length, 1)
 })
 
-test("getAccessToken: expired → silent refresh_token grant, rotated token persisted", async () => {
+test("getAccessToken: expired → silent refresh_token grant, rotated token persisted, lean record", async () => {
     seedAuth()
     const fetchImpl = mockFetch({
         [META.token_endpoint]: (params, init) => {
@@ -233,6 +276,11 @@ test("getAccessToken: expired → silent refresh_token grant, rotated token pers
     assert.equal(stored.refresh_token, "refresh-2", "rotated refresh token persisted")
     assert.equal(stored.id_token, undefined, "id_token is never stored")
     assert.equal(stored.token_endpoint, META.token_endpoint)
+    assert.deepEqual(
+        Object.keys(stored).sort(),
+        ["access_token", "client_id", "email", "expires_at", "refresh_token", "revocation_endpoint", "token_endpoint", "version"],
+        "no dead fields (issuer, obtained_at, needs_login…)"
+    )
     assert.ok(!existsSync(join(ciwgDir, "auth.lock")), "lock released")
 
     // Second call: cache hit, no network.
@@ -260,25 +308,51 @@ test("getAccessToken: missing expires_in falls back to the JWT exp claim", async
     assert.equal(result.expiresAt, exp * 1000)
 })
 
-test("getAccessToken: invalid_grant (revoked/deactivated) → relogin, cache cleared, no retry storm", async () => {
+test("getAccessToken: invalid_grant (revoked/deactivated) → relogin, ONE state (auth.json gone, who/why in state.json), no retry storm", async () => {
     seedAuth()
     const fetchImpl = mockFetch({
         [META.token_endpoint]: () => json({ error: "invalid_grant" }, 400),
     })
     const first = await getAccessToken({ fetchImpl })
     assert.deepEqual(first, { token: null, reason: "relogin" })
-    const stored = readAuth()
-    assert.equal(stored.needs_login, true)
-    assert.equal(stored.access_token, undefined)
-    assert.equal(stored.refresh_token, undefined)
-    assert.equal(stored.email, "ada@ciwebgroup.com", "identity kept for --status")
+    assert.equal(readAuth(), null, "tokens dropped — no tombstone record")
+    const state = readState()
+    assert.equal(state.relogin_email, "ada@ciwebgroup.com", "identity kept for --status")
+    assert.match(state.relogin_why, /invalid_grant/)
+    assert.match(describeAuthStatus(), /sign-in required \(was ada@ciwebgroup\.com\).*\/ciwg-login/)
 
     const second = await getAccessToken({ fetchImpl })
     assert.deepEqual(second, { token: null, reason: "relogin" })
     assert.equal(fetchImpl.calls.length, 1, "a dead refresh token is not retried")
 })
 
-test("getAccessToken: transient failures keep the tokens (network, 5xx)", async () => {
+test("getAccessToken: ONLY error=invalid_grant is terminal — other 4xx keep the tokens (invalid_client, proxy HTML 400, 401)", async () => {
+    for (const [status, body] of [
+        [400, { error: "invalid_client" }],
+        [400, "<html>Bad Request</html>"],
+        [401, { error: "invalid_request" }],
+        [429, { error: "rate_limited" }],
+    ]) {
+        seedAuth()
+        const fetchImpl = mockFetch({
+            [META.token_endpoint]: () =>
+                new Response(typeof body === "string" ? body : JSON.stringify(body), {
+                    status,
+                    headers: { "content-type": typeof body === "string" ? "text/html" : "application/json" },
+                }),
+        })
+        assert.deepEqual(
+            await getAccessToken({ fetchImpl }),
+            { token: null, reason: "http" },
+            `HTTP ${status} ${JSON.stringify(body)}`
+        )
+        assert.equal(readAuth()?.refresh_token, "refresh-1", "tokens kept")
+        assert.equal(readState().relogin_at, undefined, "not tombstoned")
+        rmSync(statePath, { force: true }) // clear the IdP backoff between cases
+    }
+})
+
+test("getAccessToken: transient failures keep the tokens and back off the IdP only (not the API)", async () => {
     seedAuth()
     const down = mockFetch({
         [META.token_endpoint]: () => {
@@ -287,20 +361,53 @@ test("getAccessToken: transient failures keep the tokens (network, 5xx)", async 
     })
     assert.deepEqual(await getAccessToken({ fetchImpl: down }), { token: null, reason: "network" })
     assert.equal(readAuth().refresh_token, "refresh-1")
+    const state = readState()
+    assert.ok(state.idp_down_until > Date.now(), "IdP backoff set")
+    assert.equal(state.api_down_until, undefined, "an IdP failure must not silence API lookups")
+    // Backed off: no second dial, and the reason says so.
+    assert.deepEqual(await getAccessToken({ fetchImpl: down }), { token: null, reason: "backoff" })
+    assert.equal(down.calls.length, 1)
 
+    rmSync(statePath, { force: true })
     const flaky = mockFetch({
         [META.token_endpoint]: () => json({ error: "server_error" }, 503),
     })
     assert.deepEqual(await getAccessToken({ fetchImpl: flaky }), { token: null, reason: "http" })
     assert.equal(readAuth().refresh_token, "refresh-1")
-    assert.equal(readAuth().needs_login, undefined)
+    assert.equal(readState().relogin_at, undefined)
 })
 
 test("getAccessToken: no cached refresh token → relogin without network", async () => {
     seedAuth({ refresh_token: undefined })
     const fetchImpl = mockFetch({})
     assert.deepEqual(await getAccessToken({ fetchImpl }), { token: null, reason: "relogin" })
-    assert.equal(readAuth().needs_login, true)
+    assert.equal(readAuth(), null)
+    assert.ok(readState().relogin_at)
+})
+
+test("getAccessToken: proactive refresh when the token expires soon; a failed one still returns the valid token", async () => {
+    seedFresh({ expires_at: Date.now() + 3 * 60_000 })
+    const fetchImpl = mockFetch({
+        [META.token_endpoint]: () => json({ access_token: "early", expires_in: 900, refresh_token: "refresh-2" }),
+    })
+    // Not due: 3 min left, no proactive window asked for.
+    assert.equal((await getAccessToken({ fetchImpl })).token, "fresh")
+    assert.equal(fetchImpl.calls.length, 0)
+    // Due within a 5-minute window.
+    const early = await getAccessToken({ fetchImpl, refreshWithinMs: 5 * 60_000 })
+    assert.equal(early.token, "early")
+    assert.equal(readAuth().refresh_token, "refresh-2")
+
+    // IdP down during a proactive refresh: the current token is still good.
+    seedFresh({ access_token: "still-good", expires_at: Date.now() + 3 * 60_000 })
+    const down = mockFetch({
+        [META.token_endpoint]: () => {
+            throw new TypeError("fetch failed")
+        },
+    })
+    const kept = await getAccessToken({ fetchImpl: down, refreshWithinMs: 5 * 60_000 })
+    assert.equal(kept.token, "still-good")
+    assert.ok(readState().idp_down_until > Date.now())
 })
 
 test("getAccessToken: concurrent callers in one process share a single refresh", async () => {
@@ -324,44 +431,72 @@ test("getAccessToken: concurrent callers in one process share a single refresh",
     assert.equal(c.token, "shared")
 })
 
-test("getAccessToken: rotation race — a sibling's newer refresh token is picked up", async () => {
+test("getAccessToken: rotation race — invalid_grant on a token a sibling rotated away is NOT a dead sign-in", async () => {
+    // Sibling persisted a fresh token under refresh-2 while our refresh-1 was in flight.
     seedAuth()
-    const fetchImpl = mockFetch({
+    const sibling = mockFetch({
         [META.token_endpoint]: (params) => {
-            if (params.get("refresh_token") === "refresh-1") {
-                // Simulate another process having rotated the token in the
-                // meantime: it persisted refresh-2 and our refresh-1 is dead.
-                seedAuth({ refresh_token: "refresh-2" })
-                return json({ error: "invalid_grant" }, 400)
-            }
-            assert.equal(params.get("refresh_token"), "refresh-2")
-            return json({ access_token: "from-2", expires_in: 300, refresh_token: "refresh-3" })
+            assert.equal(params.get("refresh_token"), "refresh-1")
+            seedFresh({ access_token: "from-sibling", refresh_token: "refresh-2" })
+            return json({ error: "invalid_grant" }, 400)
         },
     })
-    const result = await getAccessToken({ fetchImpl })
-    assert.equal(result.token, "from-2")
-    assert.equal(readAuth().refresh_token, "refresh-3")
-    assert.equal(fetchImpl.calls.length, 2)
+    const result = await getAccessToken({ fetchImpl: sibling })
+    assert.equal(result.token, "from-sibling", "the sibling's token is used")
+    assert.equal(sibling.calls.length, 1, "no second grant with the sibling's token")
+    assert.equal(readAuth().refresh_token, "refresh-2", "sibling's rotated token untouched")
+    assert.equal(readState().relogin_at, undefined, "never tombstone a token you did not own")
+
+    // Sibling rotated but its access token is not fresh (yet): transient, tokens kept.
+    seedAuth()
+    const slow = mockFetch({
+        [META.token_endpoint]: () => {
+            seedAuth({ refresh_token: "refresh-2" })
+            return json({ error: "invalid_grant" }, 400)
+        },
+    })
+    assert.deepEqual(await getAccessToken({ fetchImpl: slow }), { token: null, reason: "busy" })
+    assert.equal(readAuth().refresh_token, "refresh-2")
+    assert.equal(readState().relogin_at, undefined)
 })
 
-test("getAccessToken: lock — a stale lock is broken, a live one is waited for", async () => {
-    seedAuth()
+test("getAccessToken: lock — dead-holder pid is broken at once, a stale mtime is broken, a live one is waited for", async () => {
     const lock = join(ciwgDir, "auth.lock")
+    const fetchImpl = mockFetch({
+        [META.token_endpoint]: () => json({ access_token: "after-lock", expires_in: 300 }),
+    })
+
+    // (1) A lock whose holder pid no longer exists — fresh mtime — is broken immediately.
+    seedAuth()
+    mkdirSync(lock)
+    const dead = spawnSync(process.execPath, ["-e", "0"], { windowsHide: true })
+    writeFileSync(join(lock, "pid"), String(dead.pid))
+    const sleeps = []
+    const t0 = Date.now()
+    assert.equal(
+        (await getAccessToken({ fetchImpl, sleep: async (ms) => sleeps.push(ms) })).token,
+        "after-lock"
+    )
+    assert.deepEqual(sleeps, [], "no waiting on a dead holder")
+    assert.ok(Date.now() - t0 < 1000)
+    assert.ok(!existsSync(lock))
+
+    // (2) No pid file, mtime older than the stale threshold → broken.
+    seedAuth()
     mkdirSync(lock)
     const old = new Date(Date.now() - 60_000)
     utimesSync(lock, old, old)
-    const fetchImpl = mockFetch({
-        [META.token_endpoint]: () => json({ access_token: "after-stale", expires_in: 300 }),
-    })
-    assert.equal((await getAccessToken({ fetchImpl })).token, "after-stale")
+    assert.equal((await getAccessToken({ fetchImpl })).token, "after-lock")
     assert.ok(!existsSync(lock))
 
-    // Live lock held by "another process" that releases after 250ms and
-    // leaves a fresh token behind — we must use it, not refresh again.
+    // (3) Live lock held by "another process" (our own pid is alive) that
+    // releases after 250ms and leaves a fresh token behind — use it, never
+    // refresh with the same rotating token.
     seedAuth()
     mkdirSync(lock)
+    writeFileSync(join(lock, "pid"), String(process.pid))
     setTimeout(() => {
-        seedAuth({ access_token: "sibling", expires_at: Date.now() + 600_000 })
+        seedFresh({ access_token: "sibling" })
         rmSync(lock, { recursive: true, force: true })
     }, 250)
     const calls = fetchImpl.calls.length
@@ -370,10 +505,123 @@ test("getAccessToken: lock — a stale lock is broken, a live one is waited for"
     assert.equal(fetchImpl.calls.length, calls, "no refresh after the sibling's")
 })
 
+test("getAccessToken: a live lock that is never released → busy (no refresh, tokens kept), bounded by the deadline", async () => {
+    seedAuth()
+    const lock = join(ciwgDir, "auth.lock")
+    mkdirSync(lock)
+    writeFileSync(join(lock, "pid"), String(process.pid))
+    const fetchImpl = mockFetch({
+        [META.token_endpoint]: () => json({ access_token: "must-not-happen", expires_in: 300 }),
+    })
+    const t0 = Date.now()
+    const result = await getAccessToken({ fetchImpl, deadline: Date.now() + 2_800 })
+    const elapsed = Date.now() - t0
+    assert.deepEqual(result, { token: null, reason: "busy" })
+    assert.equal(fetchImpl.calls.length, 0, "never refresh with a token a live sibling may be rotating")
+    assert.equal(readAuth().refresh_token, "refresh-1")
+    // lockWaitBudget = 2800 - API_RESERVE - MIN_HTTP = 550ms of waiting, not LOCK_WAIT_MS.
+    assert.ok(elapsed >= 450 && elapsed < 1500, `waited ${elapsed}ms`)
+    rmSync(lock, { recursive: true, force: true })
+})
+
+test("persistAuth: a rotated refresh token is written with retries and never dies with an exception", async () => {
+    // Transient write failures: retried with backoff, then succeeds.
+    let attempts = 0
+    const sleeps = []
+    const flaky = () => {
+        attempts += 1
+        if (attempts < 3) throw Object.assign(new Error("EPERM: rename"), { code: "EPERM" })
+    }
+    assert.equal(await persistAuth({ access_token: "x" }, { sleep: async (ms) => sleeps.push(ms), write: flaky }), true)
+    assert.equal(attempts, 3)
+    assert.deepEqual(sleeps, [50, 150])
+
+    // Persistent failure: exhausts the retries, falls back, reports false — no throw.
+    const dead = () => {
+        throw Object.assign(new Error("EBUSY"), { code: "EBUSY" })
+    }
+    const sleeps2 = []
+    mkdirSync(authPath(), { recursive: true }) // auth.json as a DIRECTORY defeats the plain-write fallback too
+    assert.equal(await persistAuth({ access_token: "x" }, { sleep: async (ms) => sleeps2.push(ms), write: dead }), false)
+    assert.deepEqual(sleeps2, [50, 150, 450])
+    rmSync(authPath(), { recursive: true, force: true })
+
+    // End to end: the refresh succeeds, the disk refuses — the hook still
+    // gets the new token for THIS call and nothing is thrown.
+    seedAuth()
+    const fetchImpl = mockFetch({
+        [META.token_endpoint]: () => {
+            rmSync(authPath(), { force: true })
+            mkdirSync(authPath())
+            return json({ access_token: "in-memory-only", expires_in: 300, refresh_token: "refresh-2" })
+        },
+    })
+    const result = await getAccessToken({ fetchImpl, sleep: noSleep })
+    assert.equal(result.token, "in-memory-only")
+    rmSync(authPath(), { recursive: true, force: true })
+})
+
+// ------------------------------------------------------------ time budget
+
+test("budget: every hooks.json timeout covers HOOK_BUDGET_MS plus start-up/flush margin; lock wait ≥ refresh + 1s", () => {
+    const hooks = JSON.parse(readFileSync(join(pluginDir, "hooks", "hooks.json"), "utf8")).hooks
+    const timeouts = Object.values(hooks).flatMap((groups) =>
+        groups.flatMap((group) => group.hooks.map((h) => h.timeout))
+    )
+    assert.equal(timeouts.length, 3)
+    for (const seconds of timeouts) {
+        assert.ok(seconds * 1000 >= HOOK_BUDGET_MS + 500, `hook timeout ${seconds}s < budget ${HOOK_BUDGET_MS}ms + margin`)
+    }
+    assert.ok(TIMING.LOCK_WAIT_MS >= TIMING.HTTP_TIMEOUT_MS + 1000)
+    // A hook must have room for at least a minimal refresh AND the API reserve.
+    assert.ok(HOOK_BUDGET_MS > TIMING.API_RESERVE_MS + TIMING.MIN_HTTP_MS)
+})
+
+test("budget: refresh + API call never exceed the deadline — a hung IdP is cut so the API still had its reserve", async () => {
+    seedAuth()
+    const fetchImpl = mockFetch({ [META.token_endpoint]: hang, [SEARCH_URL]: hang })
+    const deadline = Date.now() + 3_000
+    const t0 = Date.now()
+    const result = await searchKnowledge({ q: "acme" }, { deadline, fetchImpl })
+    const elapsed = Date.now() - t0
+    assert.equal(result.status, "network", "the hung refresh is a transient failure")
+    assert.ok(elapsed < 3_000, `auth + api took ${elapsed}ms — over the ${3_000}ms deadline`)
+    // The refresh was cut at httpBudget = 3000 - API_RESERVE (1500), not HTTP_TIMEOUT (4000).
+    assert.ok(elapsed >= 1_200 && elapsed <= 2_400, `refresh cut at ${elapsed}ms`)
+    assert.equal(fetchImpl.calls.length, 1, "no API call was attempted once the credential failed")
+    assert.equal(readAuth().refresh_token, "refresh-1", "tokens kept")
+})
+
+test("budget: a hung API is cut at the remaining deadline; a spent deadline skips the call", async () => {
+    seedFresh()
+    const fetchImpl = mockFetch({ [SEARCH_URL]: hang })
+    const t0 = Date.now()
+    const result = await searchKnowledge({ q: "acme" }, { deadline: Date.now() + 1_000, fetchImpl })
+    const elapsed = Date.now() - t0
+    assert.equal(result.status, "network")
+    assert.ok(elapsed >= 800 && elapsed < 1_600, `api cut at ${elapsed}ms`)
+    assert.ok(readState().api_down_until > Date.now(), "API backoff set")
+
+    resetCredentialMemo()
+    rmSync(statePath, { force: true })
+    const spent = await searchKnowledge({ q: "acme" }, { deadline: Date.now() + 50, fetchImpl })
+    assert.equal(spent.status, "timeout")
+    assert.equal(fetchImpl.calls.length, 1, "no call started with 50ms left")
+})
+
+test("budget: a refresh with too little time left is skipped (tokens kept) rather than started", async () => {
+    seedAuth()
+    const fetchImpl = mockFetch({ [META.token_endpoint]: hang })
+    const result = await getAccessToken({ fetchImpl, deadline: Date.now() + 1_000 })
+    assert.deepEqual(result, { token: null, reason: "timeout" })
+    assert.equal(fetchImpl.calls.length, 0)
+    assert.equal(readAuth().refresh_token, "refresh-1")
+})
+
 // ------------------------------------------------------------ precedence
 
 test("resolveAuth: legacy CIWG_KNOWLEDGE_TOKEN wins over a valid SSO session", async () => {
-    seedAuth({ access_token: "fresh", expires_at: Date.now() + 600_000 })
+    seedFresh()
     process.env.CIWG_KNOWLEDGE_TOKEN = " leg acy\n"
     const fetchImpl = mockFetch({})
     const result = await resolveAuth({ fetchImpl })
@@ -383,7 +631,7 @@ test("resolveAuth: legacy CIWG_KNOWLEDGE_TOKEN wins over a valid SSO session", a
 })
 
 test("resolveAuth: legacy ~/.ciwg/knowledge.json token wins too (BOM tolerated)", async () => {
-    seedAuth({ access_token: "fresh", expires_at: Date.now() + 600_000 })
+    seedFresh()
     mkdirSync(ciwgDir, { recursive: true })
     writeFileSync(join(ciwgDir, "knowledge.json"), "﻿" + JSON.stringify({ token: "file-token" }))
     assert.equal(getLegacyToken(), "file-token")
@@ -391,23 +639,71 @@ test("resolveAuth: legacy ~/.ciwg/knowledge.json token wins too (BOM tolerated)"
     assert.deepEqual(result.headers, { "X-API-Token": "file-token" })
 })
 
-test("resolveAuth: SSO session → Bearer header; nothing → no-token; revoked → relogin", async () => {
+test("resolveAuth: SSO session → Bearer header; nothing → no-token; dropped → relogin", async () => {
     assert.deepEqual(await resolveAuth({ fetchImpl: mockFetch({}) }), { ok: false, status: "no-token" })
 
-    seedAuth({ access_token: "fresh", expires_at: Date.now() + 600_000 })
+    seedFresh()
     const ok = await resolveAuth({ fetchImpl: mockFetch({}) })
     assert.equal(ok.kind, "oidc")
     assert.deepEqual(ok.headers, { Authorization: "Bearer fresh" })
     assert.equal(ok.email, "ada@ciwebgroup.com")
+    assert.ok(ok.expiresAt > Date.now())
 
-    writeAuth({ needs_login: true, email: "ada@ciwebgroup.com" })
+    rmSync(authPath(), { force: true })
+    seedRelogin()
     assert.deepEqual(await resolveAuth({ fetchImpl: mockFetch({}) }), { ok: false, status: "relogin" })
 })
 
-test("describeFailure: sign-in statuses point at /ciwg-login", () => {
+test("API calls: credential is checked BEFORE the backoff — no-token is never masked as backoff", async () => {
+    updateState({ api_down_until: Date.now() + 60_000 })
+    assert.deepEqual(await searchKnowledge({ q: "x" }, { fetchImpl: mockFetch({}) }), { ok: false, status: "no-token" })
+    seedFresh()
+    resetCredentialMemo()
+    assert.deepEqual(await searchKnowledge({ q: "x" }, { fetchImpl: mockFetch({}) }), { ok: false, status: "backoff" })
+})
+
+test("API 401 with an SSO token → actionable api-rejected status, visible in --status, cleared by the next 2xx", async () => {
+    seedFresh()
+    let status = 401
+    const fetchImpl = mockFetch({
+        [SEARCH_URL]: (params, init) => {
+            if (process.env.CIWG_KNOWLEDGE_TOKEN) {
+                assert.equal(init.headers["X-API-Token"], "legacy")
+            } else {
+                assert.equal(init.headers.Authorization, "Bearer fresh")
+            }
+            return status === 401 ? new Response("", { status: 401 }) : json({ hits: [] })
+        },
+        [ARTIFACTS_URL]: () => new Response("", { status: 401 }),
+    })
+    assert.deepEqual(await searchKnowledge({ q: "x" }, { fetchImpl }), { ok: false, status: "api-rejected" })
+    assert.ok(readState().api_rejected_at)
+    assert.match(describeFailure("api-rejected"), /\/ciwg-login.*may not trust this app/)
+    const shown = describeAuthStatus()
+    assert.match(shown, /REJECTED this token \(HTTP 401/)
+    assert.doesNotMatch(shown, /access token valid/)
+    // Both MCP tools go through the same helper.
+    assert.deepEqual(await getSourceArtifacts({ sourceType: "a", sourceId: "b" }, { fetchImpl }), { ok: false, status: "api-rejected" })
+
+    status = 200
+    assert.equal((await searchKnowledge({ q: "x" }, { fetchImpl })).ok, true)
+    assert.equal(readState().api_rejected_at, undefined, "cleared once the API accepts the token")
+    assert.match(describeAuthStatus(), /access token valid/)
+
+    // A legacy token's 401 is the plain numeric status.
+    process.env.CIWG_KNOWLEDGE_TOKEN = "legacy"
+    resetCredentialMemo()
+    status = 401
+    assert.deepEqual(await searchKnowledge({ q: "x" }, { fetchImpl }), { ok: false, status: 401 })
+})
+
+test("describeFailure: sign-in statuses point at /ciwg-login; transient ones do not", () => {
     assert.match(describeFailure("no-token"), /\/ciwg-login/)
     assert.match(describeFailure("relogin"), /\/ciwg-login/)
     assert.doesNotMatch(describeFailure("relogin"), /token/i)
+    assert.match(describeFailure("busy"), /refreshing/)
+    assert.match(describeFailure("timeout"), /time/)
+    assert.doesNotMatch(describeFailure("busy"), /\/ciwg-login/)
 })
 
 // -------------------------------------------------------- loopback flow
@@ -423,7 +719,24 @@ function browserGet(url) {
     })
 }
 
-test("loginWithBrowser: PKCE + state + loopback end to end, tokens persisted", async () => {
+test("startLoopbackListener: 127.0.0.1 only, state-matched single shot (404 / 400 / 200 / 410), closed after", async () => {
+    const listener = await startLoopbackListener({ state: "s3cret", timeoutMs: 5_000 })
+    const base = `http://127.0.0.1:${listener.port}`
+    assert.equal((await browserGet(`${base}/`)).status, 404)
+    assert.equal((await browserGet(`${base}/callback?code=evil&state=nope`)).status, 400)
+    assert.equal((await browserGet(`${base}/callback?state=s3cret`)).status, 400, "missing code")
+    const done = await browserGet(`${base}/callback?code=the-code&state=s3cret`)
+    assert.equal(done.status, 200)
+    assert.match(done.body, /close this window/)
+    assert.deepEqual(await listener.result, { code: "the-code" })
+    assert.equal((await browserGet(`${base}/callback?code=again&state=s3cret`)).status, 410, "single shot")
+    listener.close()
+    await assert.rejects(browserGet(`${base}/callback?code=x&state=y`), "listener closed")
+})
+
+test("loginWithBrowser: PKCE + state + loopback end to end, tokens persisted, state cleared", async () => {
+    seedRelogin("old@ciwebgroup.com")
+    updateState({ api_rejected_at: 1, idp_down_until: Date.now() + 60_000, first_run_hint_at: 5 })
     let challenge
     let redirectUri
     let sentCode
@@ -444,6 +757,12 @@ test("loginWithBrowser: PKCE + state + loopback end to end, tokens persisted", a
         },
     })
     const logs = []
+    let state
+    let signalOpened
+    const opened = new Promise((resolve) => {
+        signalOpened = resolve
+    })
+    // The opener resolves at once — the flow must NOT wait on it.
     const openBrowser = async (url) => {
         const u = new URL(url)
         assert.equal(u.origin + u.pathname, META.authorization_endpoint)
@@ -454,35 +773,36 @@ test("loginWithBrowser: PKCE + state + loopback end to end, tokens persisted", a
         challenge = u.searchParams.get("code_challenge")
         redirectUri = u.searchParams.get("redirect_uri")
         assert.match(redirectUri, /^http:\/\/127\.0\.0\.1:\d+\/callback$/)
-        const state = u.searchParams.get("state")
+        state = u.searchParams.get("state")
         assert.ok(state.length >= 16)
-
-        // Probing: wrong path, wrong state, missing code — all ignored, the
-        // listener keeps waiting for the real callback.
-        assert.equal((await browserGet(`${new URL(redirectUri).origin}/`)).status, 404)
-        assert.equal((await browserGet(`${redirectUri}?code=evil&state=nope`)).status, 400)
-        assert.equal((await browserGet(`${redirectUri}?state=${state}`)).status, 400)
-
-        sentCode = "the-code"
-        const done = await browserGet(`${redirectUri}?code=${sentCode}&state=${state}`)
-        assert.equal(done.status, 200)
-        assert.match(done.body, /close this window/)
-        // Single-shot: a replay after completion is refused.
-        assert.equal((await browserGet(`${redirectUri}?code=again&state=${state}`)).status, 410)
+        signalOpened()
     }
-    const result = await loginWithBrowser({
+    const pendingLogin = loginWithBrowser({
         issuer: ISSUER,
         fetchImpl,
         openBrowser,
         log: (line) => logs.push(line),
         timeoutMs: 10_000,
     })
+    await opened
+    // Probing while the flow waits: wrong state and a missing code are ignored.
+    assert.equal((await browserGet(`${redirectUri}?code=evil&state=nope`)).status, 400)
+    assert.equal((await browserGet(`${redirectUri}?state=${state}`)).status, 400)
+    sentCode = "the-code"
+    assert.equal((await browserGet(`${redirectUri}?code=${sentCode}&state=${state}`)).status, 200)
+
+    const result = await pendingLogin
     assert.equal(result.email, "grace@ciwebgroup.com")
     assert.equal(result.hasRefreshToken, true)
     const stored = readAuth()
     assert.equal(stored.access_token, "loop-access")
     assert.equal(stored.refresh_token, "loop-refresh")
     assert.equal(stored.revocation_endpoint, META.revocation_endpoint)
+    const after = readState()
+    assert.equal(after.relogin_at, undefined, "dropped-sign-in state cleared by a login")
+    assert.equal(after.api_rejected_at, undefined)
+    assert.equal(after.idp_down_until, undefined)
+    assert.equal(after.first_run_hint_at, 5, "unrelated state untouched")
     // Nothing secret in the log: no verifier, no code, no tokens.
     const logged = logs.join("\n")
     assert.doesNotMatch(logged, /loop-access|loop-refresh|the-code|code_verifier/)
@@ -490,7 +810,7 @@ test("loginWithBrowser: PKCE + state + loopback end to end, tokens persisted", a
     await assert.rejects(browserGet(`${redirectUri}?code=x&state=y`))
 })
 
-test("loginWithBrowser: a browser that cannot open is not fatal (URL is logged)", async () => {
+test("loginWithBrowser: a browser that cannot open is not fatal (URL is logged); a BLOCKING opener does not stall the flow", async () => {
     let redirectUri
     let state
     const fetchImpl = mockFetch({
@@ -516,6 +836,25 @@ test("loginWithBrowser: a browser that cannot open is not fatal (URL is logged)"
     assert.ok(logs.some((l) => l.includes(META.authorization_endpoint)))
     await browserGet(`${redirectUri}?code=c&state=${state}`)
     assert.equal((await pending).hasRefreshToken, true)
+
+    // An opener that never returns (some xdg-open wrappers block until the
+    // window closes) must not keep the flow from finishing.
+    let uri2
+    let state2
+    const stuck = loginWithBrowser({
+        issuer: ISSUER,
+        fetchImpl,
+        openBrowser: (url) =>
+            new Promise(() => {
+                const u = new URL(url)
+                uri2 = u.searchParams.get("redirect_uri")
+                state2 = u.searchParams.get("state")
+            }),
+        timeoutMs: 10_000,
+    })
+    await new Promise((r) => setTimeout(r, 50))
+    await browserGet(`${uri2}?code=c&state=${state2}`)
+    assert.equal((await stuck).hasRefreshToken, true)
 })
 
 test("loginWithBrowser: times out and closes the listener; error callback rejects", async () => {
@@ -549,6 +888,19 @@ test("loginWithBrowser: times out and closes the listener; error callback reject
         }),
         /access_denied/
     )
+})
+
+test("browserLaunchSpec: Windows never goes through cmd.exe; the URL is one argv element, byte for byte", () => {
+    const url =
+        "https://auth.ciwebgroup.com/application/o/authorize/?redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Fcallback&scope=openid%20profile&state=a%26b%3Dc"
+    const win = browserLaunchSpec(url, "win32")
+    assert.notEqual(win.command.toLowerCase(), "cmd.exe")
+    assert.notEqual(win.command.toLowerCase(), "cmd")
+    assert.equal(win.command, "rundll32")
+    assert.deepEqual(win.args, ["url.dll,FileProtocolHandler", url], "raw URL, no quoting, no %XX% exposure")
+    assert.ok(win.args.includes(url))
+    assert.deepEqual(browserLaunchSpec(url, "darwin"), { command: "open", args: [url] })
+    assert.deepEqual(browserLaunchSpec(url, "linux"), { command: "xdg-open", args: [url] })
 })
 
 // ---------------------------------------------------------- device flow
@@ -601,6 +953,51 @@ test("loginWithDeviceCode: prints URL + code, polls with slow_down, persists", a
     assert.doesNotMatch(logged, /dev-secret|dev-access|dev-refresh/)
 })
 
+test("loginWithDeviceCode: polling survives network blips (RFC 8628) and stops at the code's own expiry", async () => {
+    let polls = 0
+    const device = () =>
+        json({ device_code: "d", user_code: "U", verification_uri: "https://sso.example.test/device", expires_in: 600, interval: 1 })
+    const blippy = mockFetch({
+        ...discoveryHandlers(),
+        [META.device_authorization_endpoint]: device,
+        [META.token_endpoint]: () => {
+            polls += 1
+            if (polls === 1) throw new TypeError("fetch failed")
+            if (polls === 2) return json({ error: "authorization_pending" }, 400)
+            if (polls === 3) throw new TypeError("fetch failed")
+            return json({ access_token: "a", expires_in: 60, refresh_token: "r" })
+        },
+    })
+    const result = await loginWithDeviceCode({ issuer: ISSUER, fetchImpl: blippy, sleep: noSleep })
+    assert.equal(result.hasRefreshToken, true)
+    assert.equal(polls, 4)
+
+    // Deferred finish long after the device code expired: no endless polling.
+    const stale = mockFetch({
+        ...discoveryHandlers(),
+        [META.device_authorization_endpoint]: device,
+        [META.token_endpoint]: () => json({ error: "authorization_pending" }, 400),
+    })
+    const started = await loginWithDeviceCode({
+        issuer: ISSUER,
+        fetchImpl: stale,
+        waitForApproval: false,
+        now: () => Date.now() - 20 * 60_000,
+    })
+    assert.equal(started.pending, true)
+    await assert.rejects(finishDeviceLogin({ fetchImpl: stale, sleep: noSleep }), /expired/)
+
+    // An IdP that stays down is reported, not polled forever.
+    const down = mockFetch({
+        ...discoveryHandlers(),
+        [META.device_authorization_endpoint]: device,
+        [META.token_endpoint]: () => {
+            throw new TypeError("fetch failed")
+        },
+    })
+    await assert.rejects(loginWithDeviceCode({ issuer: ISSUER, fetchImpl: down, sleep: noSleep }), /stayed unreachable/)
+})
+
 test("loginWithDeviceCode: deferred start/finish via the pending file", async () => {
     let polls = 0
     const fetchImpl = mockFetch({
@@ -634,10 +1031,10 @@ test("loginWithDeviceCode: deferred start/finish via the pending file", async ()
     }
     assert.equal(readAuth(), null)
 
-    const finished = await finishDeviceLogin({ fetchImpl, sleep: async () => {} })
+    const finished = await finishDeviceLogin({ fetchImpl, sleep: noSleep })
     assert.equal(finished.hasRefreshToken, true)
     assert.ok(!existsSync(pendingPath), "pending device code removed")
-    await assert.rejects(finishDeviceLogin({ fetchImpl, sleep: async () => {} }), /no pending/)
+    await assert.rejects(finishDeviceLogin({ fetchImpl, sleep: noSleep }), /no pending/)
 })
 
 test("loginWithDeviceCode: denied / expired / not enabled surface as errors", async () => {
@@ -659,7 +1056,7 @@ test("loginWithDeviceCode: denied / expired / not enabled surface as errors", as
             [META.token_endpoint]: () => json({ error }, 400),
         })
         await assert.rejects(
-            loginWithDeviceCode({ issuer: ISSUER, fetchImpl, sleep: async () => {} }),
+            loginWithDeviceCode({ issuer: ISSUER, fetchImpl, sleep: noSleep }),
             pattern
         )
     }
@@ -676,10 +1073,10 @@ test("loginWithDeviceCode: denied / expired / not enabled surface as errors", as
 
 // ----------------------------------------------------------------- logout
 
-test("logout: revokes the refresh token, wipes the cache and markers", async () => {
+test("logout: revokes the refresh token, wipes the cache and state, holds the first-run nudge for a day", async () => {
     seedAuth()
-    reloginHintDue("s1")
-    firstRunHintDue()
+    seedRelogin()
+    signInHint("relogin", "s1")
     const fetchImpl = mockFetch({
         [META.revocation_endpoint]: (params) => {
             assert.equal(params.get("token"), "refresh-1")
@@ -691,8 +1088,12 @@ test("logout: revokes the refresh token, wipes the cache and markers", async () 
     const result = await logout({ fetchImpl })
     assert.deepEqual(result, { hadSession: true, revoked: true, email: "ada@ciwebgroup.com" })
     assert.equal(readAuth(), null)
-    assert.ok(!existsSync(join(ciwgDir, "relogin-hint")))
-    assert.ok(!existsSync(join(ciwgDir, "login-hint")))
+    const state = readState()
+    assert.equal(state.relogin_at, undefined)
+    assert.equal(state.relogin_hint_session, undefined)
+    assert.ok(state.first_run_hint_at, "a deliberate sign-out is not a first run")
+    assert.equal(signInHint("no-token", "s2"), null, "no nag right after signing out")
+    assert.equal(describeAuthStatus(), "SSO: not signed in — run /ciwg-login.")
 
     // Nothing cached: a no-op, no network.
     const idle = mockFetch({})
@@ -713,25 +1114,29 @@ test("logout: revokes the refresh token, wipes the cache and markers", async () 
 
 // ---------------------------------------------------------------- hints
 
-test("firstRunHintDue: once per day", () => {
+test("signInHint: one cadence rule — first run once a day, relogin / api-rejected once per session, hourly without a session id", () => {
     const now = Date.parse("2026-09-09T12:00:00Z")
-    assert.equal(firstRunHintDue({ now }), true)
-    assert.equal(firstRunHintDue({ now: now + 60_000 }), false)
-    const marker = join(ciwgDir, "login-hint")
-    const yesterday = new Date(Date.now() - 25 * 60 * 60_000)
-    utimesSync(marker, yesterday, yesterday)
-    assert.equal(firstRunHintDue(), true)
-})
+    assert.equal(signInHint("no-token", "s1", { now }), auth.LOGIN_HINT_FIRST_RUN)
+    assert.equal(signInHint("no-token", "s2", { now: now + 60_000 }), null, "daily, regardless of session")
+    assert.equal(signInHint("no-token", "s2", { now: now + 25 * 60 * 60_000 }), auth.LOGIN_HINT_FIRST_RUN)
 
-test("reloginHintDue: once per session id", () => {
-    assert.equal(reloginHintDue("session-a"), true)
-    assert.equal(reloginHintDue("session-a"), false)
-    assert.equal(reloginHintDue("session-b"), true)
-    assert.equal(reloginHintDue("session-a"), true, "a different session re-arms it")
-    // No session id: hourly.
-    rmSync(join(ciwgDir, "relogin-hint"), { force: true })
-    assert.equal(reloginHintDue(undefined), true)
-    assert.equal(reloginHintDue(undefined), false)
+    assert.equal(signInHint("relogin", "session-a"), auth.LOGIN_HINT_RELOGIN)
+    assert.equal(signInHint("relogin", "session-a"), null)
+    assert.equal(signInHint("relogin", "session-b"), auth.LOGIN_HINT_RELOGIN)
+    assert.equal(signInHint("relogin", "session-a"), auth.LOGIN_HINT_RELOGIN, "a different session re-arms it")
+    // No session id: hourly. (The per-session calls above stamped the real
+    // clock, so this leg runs on a clock 10 h ahead of it.)
+    const later = Date.now() + 10 * 60 * 60_000
+    assert.equal(signInHint("relogin", undefined, { now: later }), auth.LOGIN_HINT_RELOGIN)
+    assert.equal(signInHint("relogin", undefined, { now: later + 60_000 }), null)
+    assert.equal(signInHint("relogin", undefined, { now: later + 61 * 60_000 }), auth.LOGIN_HINT_RELOGIN)
+
+    assert.equal(signInHint("api-rejected", "s1"), auth.LOGIN_HINT_API_REJECTED)
+    assert.equal(signInHint("api-rejected", "s1"), null)
+    // Transient statuses never nudge.
+    for (const status of ["network", "http", "busy", "timeout", "backoff", 403]) {
+        assert.equal(signInHint(status, "s1"), null)
+    }
 })
 
 // ------------------------------------------------- hooks (real processes)
@@ -767,12 +1172,12 @@ test("SessionStart hook: never signed in → one-line /ciwg-login hint, once a d
     assert.equal(first.hookSpecificOutput.additionalContext.split("\n").length, 1)
     assert.equal(runHook("session-brief.mjs", payload), null, "silent until tomorrow")
     // Compaction never nudges.
-    rmSync(join(ciwgDir, "login-hint"), { force: true })
+    rmSync(statePath, { force: true })
     assert.equal(runHook("session-brief.mjs", { ...payload, source: "compact" }), null)
 })
 
-test("hooks: revoked sign-in → one relogin line per session, then silence", () => {
-    writeAuth({ needs_login: true, email: "ada@ciwebgroup.com" })
+test("hooks: dropped sign-in → one relogin line per session, then silence", () => {
+    seedRelogin()
     const start = runHook("session-brief.mjs", { session_id: "s-9", cwd: fakeHome, source: "startup" })
     assert.match(start.hookSpecificOutput.additionalContext, /expired or been revoked.*\/ciwg-login/)
     const prompt = { session_id: "s-9", cwd: fakeHome, prompt: "what did we agree with Acme HVAC last week?" }
@@ -785,28 +1190,109 @@ test("hooks: revoked sign-in → one relogin line per session, then silence", ()
 
 test("hooks: with a legacy token the sign-in nudges never fire", () => {
     // The dead API port makes the legacy call fail fast → silent (fail-open),
-    // and crucially no login-hint marker is ever written.
+    // and crucially no first-run hint is ever recorded.
     const out = runHook(
         "session-brief.mjs",
         { session_id: "s-2", cwd: fakeHome, source: "startup" },
         { CIWG_KNOWLEDGE_TOKEN: "legacy-token" }
     )
     assert.equal(out, null)
-    assert.ok(!existsSync(join(ciwgDir, "login-hint")))
+    assert.equal(readState().first_run_hint_at, undefined)
 })
 
-test("login.mjs --status and logout.mjs never print token material", async () => {
-    seedAuth({ access_token: "sekrit-access", expires_at: Date.now() + 600_000, refresh_token: "sekrit-refresh" })
+test("hooks: a hook process finishes inside the hooks.json timeout even when the API hangs", async () => {
+    // A 127.0.0.1 API that accepts the connection and never answers.
+    const server = createServer(() => {})
+    await new Promise((r) => server.listen(0, "127.0.0.1", r))
+    const { port } = server.address()
+    try {
+        seedFresh()
+        const t0 = Date.now()
+        const out = runHook(
+            "inject-context.mjs",
+            { session_id: "s-3", cwd: fakeHome, prompt: "what did we agree with Acme HVAC last week?" },
+            { CIWG_KNOWLEDGE_URL: `http://127.0.0.1:${port}` }
+        )
+        const elapsed = Date.now() - t0
+        assert.equal(out, null, "fail-open, silent")
+        const hooks = JSON.parse(readFileSync(join(pluginDir, "hooks", "hooks.json"), "utf8")).hooks
+        const timeoutMs = hooks.UserPromptSubmit[0].hooks[0].timeout * 1000
+        assert.ok(elapsed < timeoutMs, `hook took ${elapsed}ms ≥ ${timeoutMs}ms timeout`)
+    } finally {
+        server.closeAllConnections?.()
+        server.close()
+    }
+})
+
+test("login.mjs --status and logout.mjs never print token material; the legacy note is one shared sentence", async () => {
+    seedFresh({ access_token: "sekrit-access", refresh_token: "sekrit-refresh" })
     const env = { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome, CIWG_KNOWLEDGE_TOKEN: "" }
     const status = await execFileAsync(process.execPath, [join(scriptsDir, "login.mjs"), "--status"], { env, windowsHide: true })
     assert.match(status.stdout, /signed in as ada@ciwebgroup\.com/)
     assert.doesNotMatch(status.stdout, /sekrit/)
     const out = await execFileAsync(process.execPath, [join(scriptsDir, "logout.mjs")], {
-        env: { ...env, CIWG_OIDC_ISSUER: ISSUER },
+        env: { ...env, CIWG_OIDC_ISSUER: ISSUER, CIWG_KNOWLEDGE_TOKEN: "legacy" },
         windowsHide: true,
     })
     assert.match(out.stdout, /Signed out/)
+    assert.ok(out.stdout.includes(LEGACY_TOKEN_NOTE))
     assert.doesNotMatch(out.stdout, /sekrit/)
     assert.equal(readAuth(), null)
     assert.equal(readFileSync(join(scriptsDir, "login.mjs"), "utf8").includes("console.log(tokens"), false)
+})
+
+test("login.mjs over SSH: prints the verification URL + code and RETURNS AT ONCE; --device-finish completes it", async () => {
+    // A tiny local IdP: discovery, device authorization, token (approved).
+    const server = createServer((req, res) => {
+        const send = (body, status = 200) => {
+            res.writeHead(status, { "content-type": "application/json" })
+            res.end(JSON.stringify(body))
+        }
+        const origin = `http://127.0.0.1:${server.address().port}`
+        if (req.url.endsWith("/.well-known/openid-configuration")) {
+            send({
+                issuer: `${origin}/application/o/ciwg-knowledge/`,
+                authorization_endpoint: `${origin}/authorize`,
+                token_endpoint: `${origin}/token`,
+                device_authorization_endpoint: `${origin}/device`,
+            })
+        } else if (req.url === "/device") {
+            send({ device_code: "ssh-dev", user_code: "SSHC-0DE1", verification_uri: `${origin}/activate`, expires_in: 600, interval: 1 })
+        } else if (req.url === "/token") {
+            send({ access_token: "ssh-access", expires_in: 600, refresh_token: "ssh-refresh", id_token: fakeJwt({ email: "ssh@ciwebgroup.com" }) })
+        } else {
+            send({ error: "not_found" }, 404)
+        }
+    })
+    await new Promise((r) => server.listen(0, "127.0.0.1", r))
+    const env = {
+        ...process.env,
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,
+        CIWG_KNOWLEDGE_TOKEN: "",
+        CIWG_OIDC_ISSUER: `http://127.0.0.1:${server.address().port}/application/o/ciwg-knowledge/`,
+        SSH_CONNECTION: "10.0.0.2 51234 10.0.0.1 22",
+    }
+    try {
+        const t0 = Date.now()
+        const start = await execFileAsync(process.execPath, [join(scriptsDir, "login.mjs")], { env, windowsHide: true, timeout: 15_000 })
+        const elapsed = Date.now() - t0
+        assert.ok(elapsed < 5_000, `default mode over SSH blocked for ${elapsed}ms`)
+        assert.match(start.stdout, /Headless\/SSH session detected/)
+        assert.match(start.stdout, /SSHC-0DE1/)
+        assert.match(start.stdout, /\/activate/)
+        assert.match(start.stdout, /DEVICE_CODE_PENDING/)
+        assert.doesNotMatch(start.stdout, /ssh-dev|ssh-access|ssh-refresh/)
+        assert.ok(existsSync(join(ciwgDir, "auth-pending.json")))
+        assert.equal(readAuth(), null, "nothing signed in yet")
+
+        const finish = await execFileAsync(process.execPath, [join(scriptsDir, "login.mjs"), "--device-finish"], { env, windowsHide: true, timeout: 15_000 })
+        assert.match(finish.stdout, /Signed in as ssh@ciwebgroup\.com/)
+        assert.doesNotMatch(finish.stdout, /ssh-dev|ssh-access|ssh-refresh/)
+        assert.equal(readAuth().refresh_token, "ssh-refresh")
+        assert.ok(!existsSync(join(ciwgDir, "auth-pending.json")))
+    } finally {
+        server.closeAllConnections?.()
+        server.close()
+    }
 })

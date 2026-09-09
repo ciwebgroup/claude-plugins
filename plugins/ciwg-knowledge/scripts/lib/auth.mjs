@@ -1,19 +1,26 @@
 /**
- * Sign-in for the ciwg-knowledge hooks — CIWG SSO (Authentik) via OAuth 2.1.
+ * Sign-in for the ciwg-knowledge plugin — CIWG SSO (Authentik) via OAuth 2.1.
  *
- * Why: the hooks call the knowledge REST API, which accepts an Authentik
- * access token as a Bearer credential. Nobody should have to mint an API
- * token by hand: `/ciwg-login` runs Authorization Code + PKCE against a
- * loopback redirect (opens the browser) or, for headless/SSH sessions, the
- * Device Authorization Grant (RFC 8628), and caches the result in
- * ~/.ciwg/auth.json (0600). Every hook run then uses the cached access
- * token, refreshes it silently when it expires and — when the refresh is
- * REJECTED (user deactivated in Authentik, refresh token revoked or expired)
- * — clears the cache so the hook can hint ONCE and otherwise stay silent.
+ * Why: the hooks and the local MCP server call the knowledge REST API,
+ * which accepts an Authentik access token as a Bearer credential. Nobody
+ * should have to mint an API token by hand: `/ciwg-login` runs
+ * Authorization Code + PKCE against a loopback redirect (opens the browser)
+ * or, for headless/SSH sessions, the Device Authorization Grant (RFC 8628),
+ * and caches the result in ~/.ciwg/auth.json (0600). Every hook run then
+ * uses the cached access token, refreshes it silently when it expires and —
+ * when the refresh is REJECTED (user deactivated in Authentik, refresh token
+ * revoked or expired) — drops the cache so the hooks can hint ONCE and
+ * otherwise stay silent. ONE sign-in covers hooks and MCP tools alike.
  *
  * Zero dependencies: node:crypto (PKCE), node:http (loopback listener),
  * global fetch (Node ≥ 18). Every network-touching function takes an
  * injectable `fetchImpl` so the tests never dial out.
+ *
+ * Time budget: hooks run under a hard timeout (hooks.json). Callers pass an
+ * absolute `deadline`; the lock wait, the refresh round-trip and the API
+ * call that follows are each sized from what is LEFT, so their sum can
+ * never exceed the hook budget by construction (see lockWaitBudget /
+ * httpBudget and config.mjs apiRequest).
  *
  * Precedence: a legacy `route:knowledge` API token (CIWG_KNOWLEDGE_TOKEN or
  * ~/.ciwg/knowledge.json) still works and WINS over SSO when set — CI and
@@ -28,21 +35,35 @@
 
 import { spawn } from "node:child_process"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import {
-    mkdirSync,
-    readFileSync,
-    renameSync,
-    rmSync,
-    statSync,
-    writeFileSync,
-} from "node:fs"
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { join } from "node:path"
-import { ciwgDir, debug, readJson } from "./paths.mjs"
+import {
+    ciwgDir,
+    debug,
+    escapeXml,
+    fetchWithTimeout,
+    readJson,
+    remainingMs,
+    rmQuiet,
+    writeJsonAtomic,
+} from "./paths.mjs"
+import {
+    backOff,
+    clearState,
+    isBackedOff,
+    pruneState,
+    readState,
+    updateState,
+} from "./state.mjs"
 
 const normalizeIssuer = (s) => String(s).trim().replace(/\/*$/, "/")
 
-export const OIDC_ISSUER = normalizeIssuer(
+/** One Authentik application serves everything (claude.ai connector, the
+ * plugin's login, the optional native Claude Code OAuth): its slug is the
+ * issuer path and its client id is `ciwg-knowledge`. Env-overridable for
+ * staging/local IdPs. */
+const OIDC_ISSUER = normalizeIssuer(
     process.env.CIWG_OIDC_ISSUER ||
         "https://auth.ciwebgroup.com/application/o/ciwg-knowledge/"
 )
@@ -55,22 +76,51 @@ const AUTH_VERSION = 1
 /** Treat an access token as expired this long before it really is. */
 const EXPIRY_SKEW_MS = 30_000
 const DEFAULT_TOKEN_TTL_MS = 5 * 60_000
+/** One IdP round-trip inside a hook. */
 const HTTP_TIMEOUT_MS = 4_000
-/** Cross-process refresh lock (Authentik ROTATES refresh tokens: two hooks
- * refreshing the same token concurrently would leave one with a dead token). */
+/** Interactive sign-in calls (a human is waiting, no hook budget). */
+const LOGIN_HTTP_TIMEOUT_MS = 10_000
+/**
+ * Cross-process refresh lock (Authentik ROTATES refresh tokens: two hooks
+ * refreshing the same token concurrently would leave one with a dead token,
+ * and OAuth 2.1 reuse detection can revoke the whole chain). A waiter is
+ * willing to wait at least one holder critical section (refresh + write);
+ * a lock whose holder pid is gone is broken immediately, the mtime age is
+ * the fallback when the pid is unknowable.
+ */
+const LOCK_WAIT_MS = HTTP_TIMEOUT_MS + 1_000
 const LOCK_STALE_MS = 15_000
-const LOCK_WAIT_MS = 3_000
+const LOCK_POLL_MS = 100
+/** Budget kept back for the API call that follows a refresh. */
+const API_RESERVE_MS = 1_500
+/** Below this, an HTTP call is not worth starting. */
+const MIN_HTTP_MS = 750
+/** After a network-level refresh failure, skip refreshes for this long. */
+const IDP_BACKOFF_MS = 60_000
+/** A rotated refresh token is persisted with retries — losing it forces a
+ * re-login (the old one is already revoked server-side). */
+const WRITE_RETRY_DELAYS_MS = [50, 150, 450]
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+/** Consecutive network failures tolerated while polling a device grant. */
+const DEVICE_POLL_MAX_FAILURES = 10
 const FORM_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
     Accept: "application/json",
 }
 
+/** Exposed for the budget tests only. */
+export const TIMING = Object.freeze({
+    HTTP_TIMEOUT_MS,
+    LOCK_WAIT_MS,
+    API_RESERVE_MS,
+    MIN_HTTP_MS,
+    EXPIRY_SKEW_MS,
+})
+
 export const authPath = () => join(ciwgDir(), "auth.json")
 const lockPath = () => join(ciwgDir(), "auth.lock")
+const lockPidPath = () => join(lockPath(), "pid")
 const pendingPath = () => join(ciwgDir(), "auth-pending.json")
-const FIRST_RUN_MARKER = () => join(ciwgDir(), "login-hint")
-const RELOGIN_MARKER = () => join(ciwgDir(), "relogin-hint")
 
 /** Injected into context by the hooks — one line each, once. They address
  * Claude (additionalContext is model-facing) and ask it to relay. */
@@ -78,17 +128,17 @@ export const LOGIN_HINT_FIRST_RUN =
     "ciwg-knowledge: company knowledge is not connected on this machine. Tell the user once, in one short sentence: run /ciwg-login to connect company knowledge (CIWG SSO sign-in, no token needed)."
 export const LOGIN_HINT_RELOGIN =
     "ciwg-knowledge: the company-knowledge sign-in has expired or been revoked. Tell the user once, in one short sentence: run /ciwg-login to sign in again."
+export const LOGIN_HINT_API_REJECTED =
+    "ciwg-knowledge: the knowledge API rejected the sign-in token (HTTP 401). Tell the user once, in one short sentence: re-run /ciwg-login; if it keeps happening, the server may not trust this app yet — ask the CIWG admin."
+/** The one sentence about a legacy token shadowing SSO — CLI and --status. */
+export const LEGACY_TOKEN_NOTE =
+    "Note: a legacy API token is configured (CIWG_KNOWLEDGE_TOKEN or ~/.ciwg/knowledge.json) — the hooks use it instead of SSO until you remove it."
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // ---------------------------------------------------------------- crypto
 
-const base64url = (buf) =>
-    Buffer.from(buf)
-        .toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/, "")
+const base64url = (buf) => Buffer.from(buf).toString("base64url")
 
 /** RFC 7636: a 43-char base64url verifier and its S256 challenge. */
 export function generatePkce() {
@@ -97,7 +147,7 @@ export function generatePkce() {
     return { verifier, challenge, method: "S256" }
 }
 
-export const randomToken = (bytes = 16) => base64url(randomBytes(bytes))
+const randomToken = (bytes = 16) => base64url(randomBytes(bytes))
 
 function safeEqual(a, b) {
     const left = Buffer.from(String(a))
@@ -113,8 +163,7 @@ export function decodeJwtPayload(jwt) {
     const parts = jwt.split(".")
     if (parts.length < 2) return null
     try {
-        const padded = parts[1].replace(/-/g, "+").replace(/_/g, "/")
-        const parsed = JSON.parse(Buffer.from(padded, "base64").toString("utf8"))
+        const parsed = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"))
         return parsed && typeof parsed === "object" && !Array.isArray(parsed)
             ? parsed
             : null
@@ -125,7 +174,10 @@ export function decodeJwtPayload(jwt) {
 
 // --------------------------------------------------------------- storage
 
-/** Cached sign-in state, or null when absent/unreadable/other version. */
+/** Cached sign-in, or null when absent/unreadable/other version. Fields:
+ * client_id, token_endpoint, revocation_endpoint, access_token, expires_at,
+ * refresh_token, email — nothing else. "Not signed in" is the ABSENCE of
+ * this file; why it is absent (never / revoked) lives in state.json. */
 export function readAuth() {
     const parsed = readJson(authPath())
     if (!parsed || typeof parsed !== "object") return null
@@ -133,39 +185,54 @@ export function readAuth() {
     return parsed
 }
 
-/** Atomic, owner-only write (0600; NTFS ignores the mode but %USERPROFILE%
- * is user-private by default). */
-function writeOwnerOnly(path, value) {
-    mkdirSync(ciwgDir(), { recursive: true, mode: 0o700 })
-    const tmp = `${path}.${process.pid}.${randomToken(4)}.tmp`
-    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-    renameSync(tmp, path)
-}
-
+/** Atomic, owner-only write. Throws — see persistAuth for the retrying
+ * variant the refresh path uses. */
 export function writeAuth(auth) {
-    writeOwnerOnly(authPath(), { version: AUTH_VERSION, ...auth })
+    writeJsonAtomic(authPath(), { version: AUTH_VERSION, ...auth }, { mode: 0o600 })
 }
 
-/** Forget the sign-in (and every marker that describes it). */
-export function clearAuth() {
-    for (const path of [
-        authPath(),
-        pendingPath(),
-        FIRST_RUN_MARKER(),
-        RELOGIN_MARKER(),
-    ]) {
+/**
+ * Persist tokens that MUST not be lost (a rotated refresh token: the old
+ * one is already revoked server-side). Retries the atomic write with
+ * backoff — NTFS rename can fail transiently under Defender/indexers —
+ * then falls back to a plain overwrite. Never throws; false means every
+ * attempt failed (the caller still uses the in-memory token for this call).
+ */
+export async function persistAuth(auth, { sleep = defaultSleep, write = writeAuth } = {}) {
+    for (let attempt = 0; ; attempt += 1) {
         try {
-            rmSync(path, { force: true })
-        } catch {
-            /* best effort */
+            write(auth)
+            return true
+        } catch (error) {
+            debug("persisting tokens failed:", error.code || error.message)
+            if (attempt >= WRITE_RETRY_DELAYS_MS.length) break
+            await sleep(WRITE_RETRY_DELAYS_MS[attempt])
         }
+    }
+    try {
+        writeFileSync(
+            authPath(),
+            `${JSON.stringify({ version: AUTH_VERSION, ...auth }, null, 2)}\n`,
+            { mode: 0o600 }
+        )
+        debug("tokens persisted via non-atomic fallback")
+        return true
+    } catch (error) {
+        debug("token persistence exhausted:", error.code || error.message)
+        return false
     }
 }
 
-export function isFresh(auth, now = Date.now()) {
+/** Forget the sign-in and every bit of state that describes it. */
+function clearAuth() {
+    rmQuiet(authPath())
+    rmQuiet(pendingPath())
+    clearState()
+}
+
+function isFresh(auth, now = Date.now()) {
     return Boolean(
         auth &&
-            !auth.needs_login &&
             typeof auth.access_token === "string" &&
             auth.access_token &&
             Number.isFinite(auth.expires_at) &&
@@ -173,21 +240,30 @@ export function isFresh(auth, now = Date.now()) {
     )
 }
 
-/** Keep identity (for /ciwg-login --status) but drop every token: the next
- * hook run hints once and stays silent instead of retrying a dead refresh. */
-function markNeedsLogin(auth, why) {
-    debug("sign-in required:", why)
-    try {
-        writeAuth({
-            issuer: auth?.issuer ?? OIDC_ISSUER,
-            client_id: auth?.client_id ?? OIDC_CLIENT_ID,
-            email: auth?.email,
-            needs_login: true,
-            needs_login_at: Date.now(),
-        })
-    } catch (error) {
-        debug("could not persist needs_login:", error.code || error.message)
+/** Fresh now AND not due for a proactive refresh. */
+const isFreshFor = (auth, now, withinMs) =>
+    isFresh(auth, now) && auth.expires_at - EXPIRY_SKEW_MS - now >= withinMs
+
+/**
+ * Drop the tokens (the refresh was rejected) and remember who/why in
+ * state.json so the hooks hint once and --status can explain. Compare-and-
+ * swap on the refresh token: only the token WE tried is ever tombstoned —
+ * a sibling's freshly rotated token is left alone.
+ */
+function markNeedsLogin(tried, why) {
+    const current = readAuth()
+    if (current && tried?.refresh_token && current.refresh_token !== tried.refresh_token) {
+        debug("not tombstoning: auth.json was rotated by a sibling")
+        return false
     }
+    debug("sign-in required:", why)
+    rmQuiet(authPath())
+    updateState({
+        relogin_at: Date.now(),
+        relogin_email: tried?.email ?? current?.email ?? null,
+        relogin_why: why,
+    })
+    return true
 }
 
 /** Token-endpoint response → stored record. Keeps the previous refresh
@@ -197,20 +273,19 @@ function tokenResponseToAuth(tokens, previous, meta, now) {
     if (typeof accessToken !== "string" || !accessToken) {
         throw new Error("token response lacks access_token")
     }
+    const accessClaims = decodeJwtPayload(accessToken)
     const expiresIn = Number(tokens.expires_in)
-    const jwtExp = decodeJwtPayload(accessToken)?.exp
     const expiresAt =
         Number.isFinite(expiresIn) && expiresIn > 0
             ? now + expiresIn * 1000
-            : Number.isFinite(jwtExp)
-              ? jwtExp * 1000
+            : Number.isFinite(accessClaims?.exp)
+              ? accessClaims.exp * 1000
               : now + DEFAULT_TOKEN_TTL_MS
     const refreshToken =
         typeof tokens.refresh_token === "string" && tokens.refresh_token
             ? tokens.refresh_token
             : previous?.refresh_token
-    const claims =
-        decodeJwtPayload(tokens.id_token) ?? decodeJwtPayload(accessToken) ?? {}
+    const claims = decodeJwtPayload(tokens.id_token) ?? accessClaims ?? {}
     const email =
         typeof claims.email === "string"
             ? claims.email
@@ -218,7 +293,6 @@ function tokenResponseToAuth(tokens, previous, meta, now) {
               ? claims.preferred_username
               : previous?.email
     return {
-        issuer: meta?.issuer ?? previous?.issuer ?? OIDC_ISSUER,
         client_id: previous?.client_id ?? OIDC_CLIENT_ID,
         token_endpoint: meta?.token_endpoint ?? previous?.token_endpoint,
         revocation_endpoint:
@@ -227,21 +301,10 @@ function tokenResponseToAuth(tokens, previous, meta, now) {
         expires_at: expiresAt,
         refresh_token: refreshToken,
         email,
-        obtained_at: now,
     }
 }
 
 // -------------------------------------------------------------- transport
-
-async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-        return await fetchImpl(url, { ...init, signal: controller.signal })
-    } finally {
-        clearTimeout(timer)
-    }
-}
 
 const isEndpointUrl = (value) =>
     typeof value === "string" &&
@@ -251,7 +314,7 @@ const isEndpointUrl = (value) =>
  * <issuer>/.well-known/openid-configuration. */
 export async function discover(
     issuer = OIDC_ISSUER,
-    { fetchImpl = globalThis.fetch, timeoutMs = HTTP_TIMEOUT_MS } = {}
+    { fetchImpl = globalThis.fetch, timeoutMs = LOGIN_HTTP_TIMEOUT_MS } = {}
 ) {
     const url = `${normalizeIssuer(issuer)}.well-known/openid-configuration`
     const res = await fetchWithTimeout(
@@ -316,10 +379,12 @@ const errorCode = (reply) =>
 
 /**
  * One refresh_token grant. {ok:true, auth} or {ok:false, reason} where
- * reason is "invalid_grant" (revoked/expired/rotated-away → sign in again),
- * "network", "http" (5xx/429 — transient, keep the tokens) or "malformed".
+ * reason is "invalid_grant" (the ONLY terminal answer: revoked / expired /
+ * rotated-away → sign in again), "network", "http" (anything else the
+ * server said — 5xx, 429, a proxy's HTML 400, invalid_client… — transient:
+ * keep the tokens, back off) or "malformed".
  */
-export async function refreshAccessToken(
+async function refreshAccessToken(
     auth,
     { fetchImpl = globalThis.fetch, now = Date.now(), timeoutMs = HTTP_TIMEOUT_MS } = {}
 ) {
@@ -349,83 +414,108 @@ export async function refreshAccessToken(
     }
     const code = errorCode(reply)
     debug(`token refresh rejected: HTTP ${reply.status} ${code}`)
-    if (reply.status === 400 || reply.status === 401) {
-        return { ok: false, reason: "invalid_grant", code }
-    }
+    if (code === "invalid_grant") return { ok: false, reason: "invalid_grant", code }
     return { ok: false, reason: "http", code }
 }
 
-/** True when the lock was taken; false when it could not be (held past the
- * wait budget, or an unlockable filesystem) — callers proceed regardless,
- * the lock only narrows the rotation race. */
-async function acquireLock(sleep) {
-    const deadline = Date.now() + LOCK_WAIT_MS
-    while (Date.now() <= deadline) {
+/** The holder recorded its pid; a dead holder (crashed / killed mid-refresh)
+ * is detected immediately instead of after the mtime timeout. */
+function lockIsStale() {
+    let pid = NaN
+    try {
+        pid = Number(readFileSync(lockPidPath(), "utf8").trim())
+    } catch {
+        /* holder is between mkdir and its pid write, or pre-pid lock */
+    }
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
         try {
-            mkdirSync(lockPath(), { recursive: false })
-            return true
+            process.kill(pid, 0)
         } catch (error) {
-            if (error.code !== "EEXIST") return false
-            let age = 0
-            try {
-                age = Date.now() - statSync(lockPath()).mtimeMs
-            } catch {
-                continue // holder released between our mkdir and stat
-            }
-            if (age > LOCK_STALE_MS) {
-                try {
-                    rmSync(lockPath(), { recursive: true, force: true })
-                } catch {
-                    /* retry below */
-                }
-                continue
-            }
-            await sleep(100)
+            if (error.code === "ESRCH") return true
+            /* EPERM: alive, another user's process */
         }
     }
-    return false
-}
-
-function releaseLock() {
     try {
-        rmSync(lockPath(), { recursive: true, force: true })
+        return Date.now() - statSync(lockPath()).mtimeMs > LOCK_STALE_MS
     } catch {
-        /* best effort */
+        return true // vanished between our mkdir and the stat
     }
 }
 
+/**
+ * "acquired" | "busy" (a live holder, waited `waitMs` in vain) |
+ * "unlockable" (the filesystem refuses the lock dir — then nothing else in
+ * ~/.ciwg works either, so proceed without one).
+ */
+async function acquireLock(sleep, waitMs) {
+    const deadline = Date.now() + waitMs
+    for (;;) {
+        try {
+            mkdirSync(lockPath(), { recursive: false })
+            try {
+                writeFileSync(lockPidPath(), String(process.pid))
+            } catch {
+                /* pid probe unavailable: waiters fall back to the mtime age */
+            }
+            return "acquired"
+        } catch (error) {
+            if (error.code !== "EEXIST") return "unlockable"
+        }
+        if (lockIsStale()) {
+            rmQuiet(lockPath(), { recursive: true })
+            continue
+        }
+        if (Date.now() >= deadline) return "busy"
+        await sleep(LOCK_POLL_MS)
+    }
+}
+
+const releaseLock = () => rmQuiet(lockPath(), { recursive: true })
+
+/** Time we may spend waiting for a sibling's refresh, leaving room for our
+ * own (possible) refresh and the API call. */
+const lockWaitBudget = (deadline) =>
+    Math.max(0, Math.min(LOCK_WAIT_MS, remainingMs(deadline) - API_RESERVE_MS - MIN_HTTP_MS))
+
+/** Time we may spend on the refresh round-trip itself. */
+const httpBudget = (deadline) =>
+    Math.min(HTTP_TIMEOUT_MS, remainingMs(deadline) - API_RESERVE_MS)
+
 async function refreshUnderLock(auth, opts) {
-    const locked = await acquireLock(opts.sleep)
-    try {
-        // A sibling hook may have refreshed while we waited for the lock.
+    const { now, sleep, deadline, refreshWithinMs } = opts
+    const lock = await acquireLock(sleep, lockWaitBudget(deadline))
+    if (lock === "busy") {
+        // A live sibling holds the lock and will persist a fresh token. NEVER
+        // refresh with the same rotating token in parallel — use its result
+        // if it already landed, otherwise report transient.
         const latest = readAuth()
-        if (latest?.needs_login) return { ok: false, reason: "invalid_grant" }
-        if (isFresh(latest, opts.now)) return { ok: true, auth: latest }
-        const current = latest ?? auth
-        const result = await refreshAccessToken(current, opts)
+        return isFresh(latest, now) ? { ok: true, auth: latest } : { ok: false, reason: "busy" }
+    }
+    try {
+        // A sibling may have refreshed while we waited for the lock.
+        const latest = readAuth()
+        if (!latest) {
+            return { ok: false, reason: readState().relogin_at ? "invalid_grant" : "none" }
+        }
+        if (isFreshFor(latest, now, refreshWithinMs)) return { ok: true, auth: latest }
+        const timeoutMs = httpBudget(deadline)
+        if (timeoutMs < MIN_HTTP_MS) return { ok: false, reason: "timeout" }
+        const result = await refreshAccessToken(latest, { ...opts, timeoutMs })
         if (result.ok) {
-            writeAuth(result.auth)
+            await persistAuth(result.auth, { sleep })
             return result
         }
         if (result.reason !== "invalid_grant") return result
-        // Rotation race: a sibling already persisted a NEWER refresh token.
+        // invalid_grant on a token that a sibling rotated away from under us
+        // is not a dead sign-in — the sibling's newer token is the live one.
         const again = readAuth()
-        if (
-            again?.refresh_token &&
-            again.refresh_token !== current.refresh_token
-        ) {
-            if (isFresh(again, opts.now)) return { ok: true, auth: again }
-            const retry = await refreshAccessToken(again, opts)
-            if (retry.ok) {
-                writeAuth(retry.auth)
-                return retry
-            }
-            if (retry.reason !== "invalid_grant") return retry
+        if (again && again.refresh_token !== latest.refresh_token) {
+            return isFresh(again, now) ? { ok: true, auth: again } : { ok: false, reason: "busy" }
         }
-        markNeedsLogin(current, `refresh rejected (${result.code})`)
+        markNeedsLogin(latest, `refresh rejected (${result.code})`)
         return result
     } finally {
-        if (locked) releaseLock()
+        if (lock === "acquired") releaseLock()
     }
 }
 
@@ -436,31 +526,43 @@ let inflightRefresh = null
 /**
  * Access token for the API, from cache or via a silent refresh.
  * {token, expiresAt, email} or {token:null, reason} with reason "none"
- * (never signed in), "relogin" (refresh rejected — cache cleared),
- * "network" / "http" (transient — tokens kept, try again later).
+ * (never signed in), "relogin" (refresh rejected — cache dropped),
+ * "network" / "http" / "busy" / "timeout" / "backoff" (transient — tokens
+ * kept, try again later).
+ *
+ * `deadline` (absolute ms) bounds lock wait + refresh so an API call still
+ * fits after them; `refreshWithinMs` asks for a PROACTIVE refresh when the
+ * token expires that soon — if it fails transiently, the still-valid token
+ * is returned anyway.
  */
 export async function getAccessToken({
     fetchImpl = globalThis.fetch,
     now = Date.now(),
-    timeoutMs = HTTP_TIMEOUT_MS,
     sleep = defaultSleep,
+    deadline,
+    refreshWithinMs = 0,
 } = {}) {
     const auth = readAuth()
-    if (!auth) return { token: null, reason: "none" }
-    if (auth.needs_login) return { token: null, reason: "relogin" }
-    if (isFresh(auth, now)) {
-        return { token: auth.access_token, expiresAt: auth.expires_at, email: auth.email }
-    }
+    if (!auth) return { token: null, reason: readState().relogin_at ? "relogin" : "none" }
+    const current = { token: auth.access_token, expiresAt: auth.expires_at, email: auth.email }
+    const fresh = isFresh(auth, now)
+    if (isFreshFor(auth, now, refreshWithinMs)) return current
     if (!auth.refresh_token || !auth.token_endpoint) {
+        if (fresh) return current
         markNeedsLogin(auth, "no refresh token cached")
         return { token: null, reason: "relogin" }
+    }
+    if (isBackedOff("idp_down_until", now)) {
+        debug("skipping refresh (sign-in server recently unreachable)")
+        return fresh ? current : { token: null, reason: "backoff" }
     }
     if (!inflightRefresh) {
         inflightRefresh = refreshUnderLock(auth, {
             fetchImpl,
             now,
-            timeoutMs,
             sleep,
+            deadline,
+            refreshWithinMs,
         }).finally(() => {
             inflightRefresh = null
         })
@@ -473,6 +575,10 @@ export async function getAccessToken({
             email: result.auth.email,
         }
     }
+    if (result.reason === "network" || result.reason === "http") {
+        backOff("idp_down_until", IDP_BACKOFF_MS, now)
+    }
+    if (fresh) return current // proactive refresh failed: the token is still good
     return {
         token: null,
         reason: result.reason === "invalid_grant" ? "relogin" : result.reason,
@@ -487,8 +593,8 @@ export async function getAccessToken({
  * pasted from a wrapped email) is stripped so a header-illegal character
  * can never surface the token inside a Headers error message.
  */
-export function getLegacyToken(env = process.env) {
-    let raw = env.CIWG_KNOWLEDGE_TOKEN
+export function getLegacyToken() {
+    let raw = process.env.CIWG_KNOWLEDGE_TOKEN
     if (!raw) {
         const parsed = readJson(join(ciwgDir(), "knowledge.json"))
         raw = typeof parsed?.token === "string" ? parsed.token : null
@@ -500,11 +606,11 @@ export function getLegacyToken(env = process.env) {
 /**
  * The credential the REST calls should send. Legacy token first (CI /
  * service use, explicit opt-in), else the SSO access token.
- * {ok:true, kind:"api-token"|"oidc", headers} or
- * {ok:false, status:"no-token"|"relogin"|"network"|"http"}.
+ * {ok:true, kind:"api-token"|"oidc", headers, expiresAt?, email?} or
+ * {ok:false, status:"no-token"|"relogin"|"network"|"http"|"busy"|"timeout"|"backoff"}.
  */
-export async function resolveAuth({ env = process.env, ...tokenOpts } = {}) {
-    const legacy = getLegacyToken(env)
+export async function resolveAuth(tokenOpts = {}) {
+    const legacy = getLegacyToken()
     if (legacy) {
         return { ok: true, kind: "api-token", headers: { "X-API-Token": legacy } }
     }
@@ -514,6 +620,7 @@ export async function resolveAuth({ env = process.env, ...tokenOpts } = {}) {
             ok: true,
             kind: "oidc",
             headers: { Authorization: `Bearer ${access.token}` },
+            expiresAt: access.expiresAt,
             email: access.email,
         }
     }
@@ -525,52 +632,46 @@ export async function resolveAuth({ env = process.env, ...tokenOpts } = {}) {
 
 // ----------------------------------------------------------------- hints
 
-/** First-run nudge: at most once per `everyMs` (default: daily). */
-export function firstRunHintDue({ now = Date.now(), everyMs = 24 * 60 * 60_000 } = {}) {
-    try {
-        if (now - statSync(FIRST_RUN_MARKER()).mtimeMs < everyMs) return false
-    } catch {
-        /* no marker yet */
-    }
-    try {
-        mkdirSync(ciwgDir(), { recursive: true, mode: 0o700 })
-        writeFileSync(FIRST_RUN_MARKER(), String(now))
-    } catch {
-        /* best effort — worst case the hint repeats */
-    }
-    return true
+const HINTS = {
+    "no-token": { text: LOGIN_HINT_FIRST_RUN, key: "first_run_hint", everyMs: 24 * 60 * 60_000 },
+    relogin: { text: LOGIN_HINT_RELOGIN, key: "relogin_hint", perSession: true },
+    "api-rejected": { text: LOGIN_HINT_API_REJECTED, key: "api_rejected_hint", perSession: true },
 }
 
-/** Re-login nudge: once per Claude Code session (the hook payload's
- * session_id), or hourly when no session id is available. */
-export function reloginHintDue(sessionId, { now = Date.now() } = {}) {
+/**
+ * The one-line sign-in nudge for a failed credential status, or null when
+ * it is not due. ONE cadence rule: a never-signed-in machine is nudged at
+ * most once a day; a dropped sign-in (relogin) or an API that rejects the
+ * token is nudged once per Claude Code session (the hook payload's
+ * session_id — hourly when no session id is available). Other statuses
+ * (transient failures) never nudge.
+ */
+export function signInHint(status, sessionId, { now = Date.now() } = {}) {
+    const hint = HINTS[status]
+    if (!hint) return null
+    const state = readState()
     const key = sessionId ? String(sessionId).slice(0, 120) : ""
-    try {
-        const previous = readFileSync(RELOGIN_MARKER(), "utf8").trim()
-        if (key && previous === key) return false
-        if (!key && now - statSync(RELOGIN_MARKER()).mtimeMs < 60 * 60_000) {
-            return false
-        }
-    } catch {
-        /* no marker yet */
+    const at = state[`${hint.key}_at`]
+    if (hint.perSession && key) {
+        if (state[`${hint.key}_session`] === key) return null
+    } else if (Number.isFinite(at) && now - at < (hint.everyMs ?? 60 * 60_000)) {
+        return null
     }
-    try {
-        mkdirSync(ciwgDir(), { recursive: true, mode: 0o700 })
-        writeFileSync(RELOGIN_MARKER(), key)
-    } catch {
-        /* best effort */
-    }
-    return true
+    updateState({ [`${hint.key}_at`]: now, [`${hint.key}_session`]: key || null })
+    return hint.text
+}
+
+/** The REST API answered 401 to an SSO token that looked valid — remember
+ * which token (by its expiry) so --status can say so instead of "valid". */
+export function markApiRejected(expiresAt) {
+    updateState({ api_rejected_at: Date.now(), api_rejected_token_exp: expiresAt ?? null })
+}
+
+export function clearApiRejected() {
+    if (readState().api_rejected_at) pruneState(["api_rejected"])
 }
 
 // ------------------------------------------------------- loopback login
-
-const escapeHtml = (s) =>
-    String(s)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
 
 function htmlPage(res, status, title, body) {
     res.writeHead(status, {
@@ -579,9 +680,9 @@ function htmlPage(res, status, title, body) {
         Connection: "close",
     })
     res.end(
-        `<!doctype html><meta charset="utf-8"><title>${escapeHtml(title)}</title>` +
+        `<!doctype html><meta charset="utf-8"><title>${escapeXml(title)}</title>` +
             `<body style="font-family:system-ui;margin:3rem auto;max-width:32rem;text-align:center">` +
-            `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(body)}</p></body>`
+            `<h1>${escapeXml(title)}</h1><p>${escapeXml(body)}</p></body>`
     )
 }
 
@@ -590,22 +691,17 @@ function htmlPage(res, status, title, body) {
  * {port, result, close}; `result` settles with {code} on a state-matched
  * /callback, rejects on an `error` callback or after timeoutMs. Mismatched
  * state gets a 400 and is IGNORED (the listener keeps waiting). The auth
- * code is never logged.
+ * code is never logged. Callers must attach to `result` before yielding.
  */
-export function startLoopbackListener({ state, timeoutMs, host = "127.0.0.1" }) {
+export function startLoopbackListener({ state, timeoutMs }) {
     return new Promise((resolveStart, rejectStart) => {
         let settle
         const result = new Promise((resolve, reject) => {
             settle = { resolve, reject }
         })
-        // The callback (or the timeout) can land while the caller is still
-        // awaiting openBrowser(); without a handler attached that early
-        // rejection would be "unhandled" and crash the login process.
-        result.catch(() => {})
-        const sockets = new Set()
         let done = false
         const server = createServer((req, res) => {
-            const url = new URL(req.url ?? "/", `http://${host}`)
+            const url = new URL(req.url ?? "/", "http://127.0.0.1")
             if (url.pathname !== "/callback") {
                 res.writeHead(404, { Connection: "close" })
                 res.end("Not found")
@@ -636,12 +732,8 @@ export function startLoopbackListener({ state, timeoutMs, host = "127.0.0.1" }) 
             htmlPage(res, 200, "Signed in", "You can close this window and return to Claude Code.")
             settle.resolve({ code })
         })
-        server.on("connection", (socket) => {
-            sockets.add(socket)
-            socket.on("close", () => sockets.delete(socket))
-        })
         server.once("error", rejectStart)
-        server.listen(0, host, () => {
+        server.listen(0, "127.0.0.1", () => {
             const { port } = server.address()
             const timer = setTimeout(() => {
                 settle.reject(
@@ -652,7 +744,7 @@ export function startLoopbackListener({ state, timeoutMs, host = "127.0.0.1" }) 
             }, timeoutMs)
             const close = () => {
                 clearTimeout(timer)
-                for (const socket of sockets) socket.destroy()
+                server.closeAllConnections?.()
                 server.close()
             }
             resolveStart({ port, result, close })
@@ -660,28 +752,30 @@ export function startLoopbackListener({ state, timeoutMs, host = "127.0.0.1" }) 
     })
 }
 
+/**
+ * How to hand a URL to the default browser, per platform. Windows goes
+ * through rundll32's FileProtocolHandler — NEVER `cmd.exe /c start`, which
+ * expands %XX% sequences inside quotes and mangles the percent-encoded
+ * redirect_uri when an environment variable happens to match. The URL is
+ * passed as ONE argv element, byte for byte.
+ */
+export function browserLaunchSpec(url, platform = process.platform) {
+    if (platform === "win32") {
+        return { command: "rundll32", args: ["url.dll,FileProtocolHandler", url] }
+    }
+    if (platform === "darwin") return { command: "open", args: [url] }
+    return { command: "xdg-open", args: [url] }
+}
+
 /** Open a URL in the default browser, detached; rejects if no opener. */
-export function openInBrowser(url) {
+function openInBrowser(url) {
     return new Promise((resolve, reject) => {
         if (!/^https?:\/\/[^\s"'<>]+$/.test(url)) {
             reject(new Error("refusing to open a non-http URL"))
             return
         }
-        const options = { detached: true, stdio: "ignore", windowsHide: true }
-        let child
-        if (process.platform === "win32") {
-            // `start "" "<url>"`: the empty title keeps `start` from treating
-            // the quoted URL as a window title; verbatim args keep cmd.exe
-            // from splitting on `&`.
-            child = spawn("cmd.exe", ["/c", "start", '""', `"${url}"`], {
-                ...options,
-                windowsVerbatimArguments: true,
-            })
-        } else if (process.platform === "darwin") {
-            child = spawn("open", [url], options)
-        } else {
-            child = spawn("xdg-open", [url], options)
-        }
+        const { command, args } = browserLaunchSpec(url)
+        const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true })
         child.once("error", reject)
         child.once("spawn", () => {
             child.unref()
@@ -701,7 +795,7 @@ async function exchangeCode({ meta, clientId, code, redirectUri, verifier, fetch
             client_id: clientId,
             code_verifier: verifier,
         },
-        10_000
+        LOGIN_HTTP_TIMEOUT_MS
     )
     if (!reply.ok) {
         throw new Error(`token exchange failed (HTTP ${reply.status}, ${errorCode(reply)})`)
@@ -716,14 +810,9 @@ function finishLogin(tokens, meta, clientId, now, log) {
             "Warning: no refresh token was issued — you will be asked to sign in again when the access token expires. Ask the admin to add the offline_access scope mapping to the ciwg-knowledge provider."
         )
     }
-    writeAuth(auth)
-    try {
-        rmSync(RELOGIN_MARKER(), { force: true })
-        rmSync(FIRST_RUN_MARKER(), { force: true })
-        rmSync(pendingPath(), { force: true })
-    } catch {
-        /* best effort */
-    }
+    writeAuth(auth) // a login that cannot persist IS a failure — let it throw
+    rmQuiet(pendingPath())
+    pruneState(["relogin", "api_rejected", "idp_down"])
     return {
         email: auth.email,
         expiresAt: auth.expires_at,
@@ -763,11 +852,11 @@ export async function loginWithBrowser({
         authorizeUrl.searchParams.set("code_challenge_method", pkce.method)
         log("Opening your browser to sign in with CIWG SSO…")
         log(`If it does not open, visit:\n  ${authorizeUrl}`)
-        try {
-            await openBrowser(authorizeUrl.toString())
-        } catch (error) {
-            log(`(could not open a browser automatically: ${error.message})`)
-        }
+        // Not awaited: some openers block until the browser window closes,
+        // and the callback can land before they return.
+        Promise.resolve()
+            .then(() => openBrowser(authorizeUrl.toString()))
+            .catch((error) => log(`(could not open a browser automatically: ${error.message})`))
         const { code } = await listener.result
         const tokens = await exchangeCode({
             meta,
@@ -785,10 +874,16 @@ export async function loginWithBrowser({
 
 // --------------------------------------------------------- device login
 
+/**
+ * Poll the token endpoint per RFC 8628 until approved: honours `interval`
+ * and `slow_down`, keeps polling through network blips (a bounded run of
+ * consecutive failures), and stops at the device code's own expiry.
+ */
 async function pollDeviceGrant({
     meta,
     clientId,
     device,
+    startedAt,
     fetchImpl,
     sleep,
     now,
@@ -797,22 +892,33 @@ async function pollDeviceGrant({
 }) {
     let interval = Math.max(1, Number(device.interval) || 5) * 1000
     const expiresIn = Math.max(30, Number(device.expires_in) || 600) * 1000
-    const deadline = now() + Math.min(expiresIn, timeoutMs)
+    const deadline = Math.min(startedAt + expiresIn, now() + timeoutMs)
+    const expired = () => new Error("the device code expired before the sign-in was approved")
+    let failures = 0
     for (;;) {
         await sleep(interval)
-        if (now() > deadline) {
-            throw new Error("the device code expired before the sign-in was approved")
+        if (now() > deadline) throw expired()
+        let reply
+        try {
+            reply = await postForm(
+                fetchImpl,
+                meta.token_endpoint,
+                {
+                    grant_type: DEVICE_GRANT,
+                    device_code: device.device_code,
+                    client_id: clientId,
+                },
+                LOGIN_HTTP_TIMEOUT_MS
+            )
+        } catch (error) {
+            failures += 1
+            debug("device poll network failure:", error.name)
+            if (failures > DEVICE_POLL_MAX_FAILURES) {
+                throw new Error("the sign-in server stayed unreachable while waiting for approval")
+            }
+            continue
         }
-        const reply = await postForm(
-            fetchImpl,
-            meta.token_endpoint,
-            {
-                grant_type: DEVICE_GRANT,
-                device_code: device.device_code,
-                client_id: clientId,
-            },
-            10_000
-        )
+        failures = 0
         if (reply.ok) return finishLogin(reply.body, meta, clientId, now(), log)
         const code = errorCode(reply)
         if (code === "authorization_pending") continue
@@ -820,18 +926,19 @@ async function pollDeviceGrant({
             interval += 5000
             continue
         }
-        if (code === "expired_token") {
-            throw new Error("the device code expired before the sign-in was approved")
-        }
+        if (code === "expired_token") throw expired()
         if (code === "access_denied") throw new Error("the sign-in was denied")
         throw new Error(`device sign-in failed (HTTP ${reply.status}, ${code})`)
     }
 }
 
 /**
- * Device Authorization Grant (RFC 8628) — the headless/SSH fallback. Prints
- * the verification URL + user code through `log`, then (unless
- * waitForApproval is false) polls the token endpoint until approved.
+ * Device Authorization Grant (RFC 8628) — the headless/SSH path. Prints
+ * the verification URL + user code through `log` FIRST, then either polls
+ * until approved (waitForApproval, for a real terminal) or records the
+ * pending grant in auth-pending.json and returns at once (the slash
+ * command: a Bash-tool run cannot show the code while it waits — the
+ * approval is collected by finishDeviceLogin).
  * Authentik requires a brand-level "device code flow" to be configured or
  * the device endpoint answers 4xx — the error says so.
  */
@@ -856,7 +963,7 @@ export async function loginWithDeviceCode({
             fetchImpl,
             endpoint,
             { client_id: clientId, scope: scopes },
-            10_000
+            LOGIN_HTTP_TIMEOUT_MS
         )
     } catch (error) {
         throw new Error(`device authorization request failed (${error.name})`)
@@ -879,14 +986,13 @@ export async function loginWithDeviceCode({
             ? device.verification_uri_complete
             : device.verification_uri
     log(`On any device, open:\n  ${where}\nand enter the code:  ${device.user_code}`)
+    const startedAt = now()
     if (!waitForApproval) {
-        writeOwnerOnly(pendingPath(), {
-            version: AUTH_VERSION,
-            created_at: now(),
-            client_id: clientId,
-            meta,
-            device,
-        })
+        writeJsonAtomic(
+            pendingPath(),
+            { version: AUTH_VERSION, created_at: startedAt, client_id: clientId, meta, device },
+            { mode: 0o600 }
+        )
         return {
             pending: true,
             userCode: device.user_code,
@@ -897,6 +1003,7 @@ export async function loginWithDeviceCode({
         meta,
         clientId,
         device,
+        startedAt,
         fetchImpl,
         sleep,
         now,
@@ -922,6 +1029,7 @@ export async function finishDeviceLogin({
         meta: pending.meta,
         clientId: pending.client_id || OIDC_CLIENT_ID,
         device: pending.device,
+        startedAt: Number.isFinite(pending.created_at) ? pending.created_at : now(),
         fetchImpl,
         sleep,
         now,
@@ -934,7 +1042,7 @@ export async function finishDeviceLogin({
 
 /** Best-effort revocation of the refresh token, then forget everything.
  * Never throws — the local wipe is what matters. */
-export async function logout({ fetchImpl = globalThis.fetch, timeoutMs = HTTP_TIMEOUT_MS } = {}) {
+export async function logout({ fetchImpl = globalThis.fetch, timeoutMs = LOGIN_HTTP_TIMEOUT_MS } = {}) {
     const auth = readAuth()
     let revoked = false
     if (auth?.refresh_token && auth.revocation_endpoint) {
@@ -956,35 +1064,40 @@ export async function logout({ fetchImpl = globalThis.fetch, timeoutMs = HTTP_TI
         }
     }
     clearAuth()
+    // A deliberate sign-out is not a first run: the user knows /ciwg-login.
+    // Hold the daily "connect company knowledge" nudge for a day.
+    updateState({ first_run_hint_at: Date.now() })
     return { hadSession: Boolean(auth), revoked, email: auth?.email }
 }
 
 // ---------------------------------------------------------------- status
 
 /** Human line(s) for `login.mjs --status`. Never includes token material. */
-export function describeAuthStatus({ env = process.env, now = Date.now() } = {}) {
+export function describeAuthStatus({ now = Date.now() } = {}) {
     const lines = []
-    if (getLegacyToken(env)) {
-        lines.push(
-            "Legacy API token configured (CIWG_KNOWLEDGE_TOKEN or ~/.ciwg/knowledge.json) — it takes precedence over SSO until removed."
-        )
-    }
+    if (getLegacyToken()) lines.push(LEGACY_TOKEN_NOTE)
     const auth = readAuth()
+    const state = readState()
     if (!auth) {
-        lines.push("SSO: not signed in — run /ciwg-login.")
-    } else if (auth.needs_login) {
-        lines.push(
-            `SSO: sign-in required${auth.email ? ` (was ${auth.email})` : ""} — the session expired or was revoked; run /ciwg-login.`
-        )
-    } else {
-        const minutes = Math.round(((auth.expires_at ?? 0) - now) / 60_000)
-        const validity =
-            minutes > 0
-                ? `access token valid for ~${minutes} min`
-                : "access token expired — refreshes on next use"
-        lines.push(
-            `SSO: signed in as ${auth.email ?? "(unknown user)"} — ${validity}; refresh token ${auth.refresh_token ? "cached" : "MISSING"}.`
-        )
+        if (state.relogin_at) {
+            const who = state.relogin_email ? ` (was ${state.relogin_email})` : ""
+            const why = state.relogin_why ? `: ${state.relogin_why}` : ""
+            lines.push(`SSO: sign-in required${who} — the session expired or was revoked${why}; run /ciwg-login.`)
+        } else {
+            lines.push("SSO: not signed in — run /ciwg-login.")
+        }
+        return lines.join("\n")
     }
+    const minutes = Math.round(((auth.expires_at ?? 0) - now) / 60_000)
+    const rejected =
+        state.api_rejected_at && state.api_rejected_token_exp === auth.expires_at
+    const validity = rejected
+        ? `but the knowledge API REJECTED this token (HTTP 401 at ${new Date(state.api_rejected_at).toISOString()}) — re-run /ciwg-login; if it persists the server may not trust this app yet`
+        : minutes > 0
+          ? `access token valid for ~${minutes} min`
+          : "access token expired — refreshes on next use"
+    lines.push(
+        `SSO: signed in as ${auth.email ?? "(unknown user)"} — ${validity}; refresh token ${auth.refresh_token ? "cached" : "MISSING"}.`
+    )
     return lines.join("\n")
 }

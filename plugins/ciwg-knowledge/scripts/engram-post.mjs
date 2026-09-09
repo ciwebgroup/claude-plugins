@@ -10,13 +10,14 @@
  *
  * Fail-open and fast: opt-out (CIWG_ENGRAM=off, or "engram": false in
  * ~/.ciwg/knowledge.json), not signed in / sign-in revoked, unmapped
- * scratch dir, network down, or the 60s backoff marker → exit 0 silently,
- * session exit unaffected. (No login hint here — a session that is ending
- * has no one left to read it.)
+ * scratch dir, network down, or the 60s backoff → exit 0 silently,
+ * session exit unaffected. Bounded by the hook deadline. (No login hint
+ * here — a session that is ending has no one left to read it.)
  */
 
 import {
     debug,
+    hookDeadline,
     isEngramOptedOut,
     postEngramActivity,
     readStdin,
@@ -35,7 +36,7 @@ try {
     })
     if (!digest) process.exit(0)
 
-    const result = await postEngramActivity(digest)
+    const result = await postEngramActivity(digest, { deadline: hookDeadline() })
     if (!result.ok) debug("engram post failed:", result.status)
     process.exit(0)
 } catch (error) {

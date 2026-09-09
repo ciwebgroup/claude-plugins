@@ -1,11 +1,12 @@
 /**
- * ciwg-knowledge LOCAL (stdio) MCP server — the fallback explicit retrieval
- * surface. The plugin's primary MCP entry is the remote server at
- * https://api.ciwebgroup.com/mcp (Claude Code signs in to it natively with
- * CIWG SSO — see plugin.json). This stdio server wraps the same REST API
- * with the hooks' credential (SSO cache from /ciwg-login, or a legacy
- * token) for environments where the remote server is unreachable or
- * blocked; register it by hand as documented in the README.
+ * ciwg-knowledge MCP server (stdio) — the plugin's explicit retrieval
+ * surface, registered by plugin.json. It wraps the knowledge REST API with
+ * the SAME credential the hooks use (the /ciwg-login SSO cache, or a
+ * legacy token), so one sign-in covers hooks and tools alike.
+ *
+ * The remote connector (https://api.ciwebgroup.com/mcp, native OAuth) is
+ * the claude.ai / Claude Desktop path; Claude Code users who prefer it can
+ * add it by hand — see the README.
  *
  * Raw newline-delimited JSON-RPC over stdio; no SDK dependency so the
  * plugin needs no install step.
@@ -18,8 +19,10 @@
  */
 
 import { createInterface } from "node:readline"
-import { resolveAuth } from "./lib/auth.mjs"
-import { API_BASE, describeFailure, searchKnowledge } from "./lib/config.mjs"
+import { describeFailure, getSourceArtifacts, searchKnowledge } from "./lib/config.mjs"
+
+/** A human is waiting on a tool call, not a hook timer. */
+const TOOL_TIMEOUT_MS = 8_000
 
 const TOOLS = [
     {
@@ -90,7 +93,7 @@ async function callTool(name, args) {
                         : undefined,
                 limit: clampInt(args.limit, 1, 20),
             },
-            8000
+            { timeoutMs: TOOL_TIMEOUT_MS }
         )
         if (!result.ok) return errText(describeFailure(result.status))
         const hits = (result.data.hits ?? []).map((h) => ({
@@ -104,27 +107,12 @@ async function callTool(name, args) {
         return text(JSON.stringify({ mode: result.data.mode, hits }, null, 2))
     }
     if (name === "get_source_artifacts") {
-        const auth = await resolveAuth()
-        if (!auth.ok) return errText(describeFailure(auth.status))
-        const url = new URL(`${API_BASE}/api/v1/knowledge/artifacts`)
-        url.searchParams.set("source_type", String(args.source_type ?? ""))
-        url.searchParams.set("source_id", String(args.source_id ?? ""))
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 8000)
-        try {
-            const res = await fetch(url, {
-                headers: auth.headers,
-                signal: controller.signal,
-            })
-            if (!res.ok) return errText(describeFailure(res.status))
-            return text(JSON.stringify(await res.json(), null, 2))
-        } catch {
-            // Never surface error.message here — a header-illegal token
-            // value would be echoed back into the transcript by Node.
-            return errText(describeFailure("network"))
-        } finally {
-            clearTimeout(timer)
-        }
+        const result = await getSourceArtifacts(
+            { sourceType: args.source_type, sourceId: args.source_id },
+            { timeoutMs: TOOL_TIMEOUT_MS }
+        )
+        if (!result.ok) return errText(describeFailure(result.status))
+        return text(JSON.stringify(result.data, null, 2))
     }
     return errText(`Unknown tool "${name}"`)
 }

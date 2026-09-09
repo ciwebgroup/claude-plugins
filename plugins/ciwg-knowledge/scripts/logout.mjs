@@ -2,12 +2,11 @@
 /**
  * ciwg-knowledge sign-out — `node scripts/logout.mjs` or `/ciwg-logout`.
  * Revokes the cached refresh token at Authentik (best effort) and deletes
- * ~/.ciwg/auth.json plus the hint markers. Never prints tokens.
+ * ~/.ciwg/auth.json plus the plugin state. Never prints tokens.
  */
 
-import { getLegacyToken, logout } from "./lib/auth.mjs"
-
-const say = (line) => process.stdout.write(`${line}\n`)
+import { LEGACY_TOKEN_NOTE, getLegacyToken, logout } from "./lib/auth.mjs"
+import { say } from "./lib/paths.mjs"
 
 try {
     const result = await logout()
@@ -18,11 +17,7 @@ try {
             `Signed out${result.email ? ` (${result.email})` : ""} — local sign-in removed${result.revoked ? ", refresh token revoked at CIWG SSO" : ""}.`
         )
     }
-    if (getLegacyToken()) {
-        say(
-            "Note: a legacy API token is still configured (CIWG_KNOWLEDGE_TOKEN or ~/.ciwg/knowledge.json) — the hooks will keep using it until you remove it."
-        )
-    }
+    if (getLegacyToken()) say(LEGACY_TOKEN_NOTE)
     process.exitCode = 0
 } catch (error) {
     say(`Sign-out failed: ${error?.message ?? error}`)

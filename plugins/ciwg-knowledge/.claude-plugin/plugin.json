@@ -1,20 +1,15 @@
 {
     "name": "ciwg-knowledge",
     "version": "0.2.0",
-    "description": "CIWG company-knowledge auto-injection. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. Sign in once with CIWG SSO (/ciwg-login); no API tokens. Remote MCP tools included for explicit deep dives.",
+    "description": "CIWG company-knowledge auto-injection. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. Sign in once with CIWG SSO (/ciwg-login); no API tokens. MCP tools included for explicit deep dives, on the same sign-in.",
     "author": {
         "name": "CI Web Group"
     },
     "hooks": "./hooks/hooks.json",
     "mcpServers": {
         "ciwg-knowledge": {
-            "type": "http",
-            "url": "https://api.ciwebgroup.com/mcp",
-            "oauth": {
-                "clientId": "ciwg-knowledge",
-                "scopes": "openid profile email groups offline_access",
-                "authServerMetadataUrl": "https://auth.ciwebgroup.com/application/o/ciwg-knowledge/.well-known/openid-configuration"
-            }
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/knowledge-mcp.mjs"]
         }
     }
 }

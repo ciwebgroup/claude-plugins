@@ -1,10 +1,12 @@
 /**
- * Tiny shared leaf module — the bits both config.mjs and auth.mjs need
- * without importing each other (a circular import between the two would
+ * Tiny shared leaf module — the bits config.mjs, auth.mjs and state.mjs
+ * need without importing each other (a circular import between them would
  * work under ESM but is fragile; keeping the leaf separate is simpler).
+ *
+ * Everything here is dependency-free and side-effect-free at import time.
  */
 
-import { readFileSync } from "node:fs"
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, join } from "node:path"
 
@@ -14,8 +16,29 @@ export function debug(...args) {
     }
 }
 
+/** One line to stdout — the CLI scripts' only output channel. */
+export const say = (line) => process.stdout.write(`${line}\n`)
+
 /** ~/.ciwg — resolved at call time so tests can redirect HOME/USERPROFILE. */
 export const ciwgDir = () => join(homedir(), ".ciwg")
+
+/**
+ * ~/.ciwg exists and is owner-only (0700). The ONE place the directory is
+ * created: every writer (tokens, state, legacy config) goes through here so
+ * its permissions never depend on which hook happened to run first. NTFS
+ * ignores the mode; %USERPROFILE% is user-private by default.
+ */
+export function ensureCiwgDir() {
+    const dir = ciwgDir()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    if (process.platform !== "win32") {
+        try {
+            chmodSync(dir, 0o700) // tighten a directory an older version left at 0755
+        } catch {
+            /* not ours to chmod (symlink, other owner) — the mkdir mode stands */
+        }
+    }
+}
 
 export const stripBom = (s) => s.replace(/^﻿/, "")
 
@@ -30,3 +53,57 @@ export function readJson(path) {
         return null
     }
 }
+
+/**
+ * Atomic JSON write (temp file + rename, so a reader never sees a torn
+ * file) with an explicit mode. Throws on failure — callers decide whether
+ * that is fatal (a login) or must be retried/absorbed (a token rotation).
+ */
+export function writeJsonAtomic(path, value, { mode = 0o600 } = {}) {
+    ensureCiwgDir()
+    const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
+    try {
+        writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode })
+        renameSync(tmp, path)
+    } catch (error) {
+        rmQuiet(tmp)
+        throw error
+    }
+}
+
+/** rm -f that never throws (best-effort cleanup on fail-open paths). */
+export function rmQuiet(path, options = {}) {
+    try {
+        rmSync(path, { force: true, ...options })
+    } catch {
+        /* best effort */
+    }
+}
+
+/** Escape for XML/HTML attribute or body context — untrusted values only
+ * ever reach the model or a browser through this. */
+export function escapeXml(value) {
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+}
+
+/** fetch with a hard timeout (AbortController). Rejects with the abort
+ * error when the budget runs out; the caller maps that to a transient
+ * failure. Every network call in the plugin goes through here. */
+export async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), Math.max(0, timeoutMs))
+    try {
+        return await fetchImpl(url, { ...init, signal: controller.signal })
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+/** Milliseconds left before an absolute `deadline` (ms epoch), or Infinity
+ * when no deadline was given. Negative once it has passed. */
+export const remainingMs = (deadline, now = Date.now()) =>
+    Number.isFinite(deadline) ? deadline - now : Infinity

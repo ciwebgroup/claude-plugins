@@ -1,9 +1,10 @@
 /**
  * Engram hook tests — digest construction against a real throwaway git
  * repo, the opt-out switches, the no-token fail-open, and the injection
- * rendering. Run from the repo root (or anywhere):
+ * rendering. Run from the repo root (pass the files — the directory form
+ * is not supported by every Node):
  *
- *   node --test plugins/ciwg-knowledge/tests/
+ *   node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs
  *
  * No network is touched: the only API-path test asserts the no-token
  * short-circuit. HOME/USERPROFILE are pointed at a throwaway dir so the
