@@ -17,7 +17,7 @@
 
 import assert from "node:assert/strict"
 import { execFile, execFileSync, spawn } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { createServer, get as httpGet } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -96,18 +96,22 @@ const { readState, updateState } = await import("../scripts/lib/state.mjs")
 const {
     AUTO_LOGIN_CONTEXT,
     AUTO_LOGIN_MESSAGE,
+    AUTO_LOGIN_MESSAGE_NO_URL,
     OIDC_CLIENT_ID,
     autoLoginDecision,
     beginBackgroundLogin,
     claimAutoLogin,
     describeAuthStatus,
     isAutoLoginOptedOut,
+    isEndpointUrl,
     looksHeadless,
     publishAutoLoginUrl,
     readAuth,
     readAutoLoginMarker,
     releaseAutoLogin,
+    signInCooldownMs,
     spawnAutoLogin,
+    tryClaimAutoLogin,
     writeAuth,
 } = auth
 
@@ -275,6 +279,66 @@ test("publishAutoLoginUrl only touches an attempt this process owns", () => {
     releaseAutoLogin()
 })
 
+test("claimAutoLogin: an unparsable marker with a fresh mtime is a sibling mid-write (torn read) and is left alone; only an OLD unparsable one is replaced", () => {
+    mkdirSync(ciwgDir, { recursive: true })
+    const torn = '{"version": 1, "pid": '
+    writeFileSync(markerPath, torn)
+    const now = Date.now()
+    assert.equal(tryClaimAutoLogin({ now }), "sibling")
+    assert.equal(claimAutoLogin({ now }), false)
+    assert.equal(readFileSync(markerPath, "utf8"), torn, "the sibling's half-written marker survives")
+    assert.equal(autoLoginDecision("no-token", { now }), "due", "…even though nobody can read it as live yet")
+
+    const old = new Date(now - 10_000)
+    utimesSync(markerPath, old, old)
+    assert.equal(tryClaimAutoLogin({ now }), "owned", "old garbage is replaced")
+    assert.equal(readAutoLoginMarker({ now }).pid, process.pid)
+    releaseAutoLogin()
+    assert.ok(!existsSync(markerPath))
+})
+
+test("readAutoLoginMarker: a marker url is relayed only when it is an https or loopback-http link (one token, bounded) — the marker itself still counts as live", () => {
+    const now = Date.now()
+    mkdirSync(ciwgDir, { recursive: true })
+    const write = (url) =>
+        writeFileSync(markerPath, JSON.stringify({ version: 1, pid: process.pid, started_at: now, url, url_at: now }))
+    for (const bad of [
+        "javascript:alert(1)",
+        "http://evil.example/authorize",
+        "file:///etc/passwd",
+        "https://sso.example/authorize?x=1 y",
+        "https://sso.example/a\nhttp://x",
+        'https://sso.example/a"onclick',
+        42,
+        `https://sso.example/${"a".repeat(5_000)}`,
+    ]) {
+        write(bad)
+        const marker = readAutoLoginMarker({ now })
+        assert.ok(marker, `live: ${String(bad).slice(0, 40)}`)
+        assert.equal(marker.url, undefined, `dropped: ${String(bad).slice(0, 40)}`)
+        assert.equal(autoLoginDecision("no-token", { now }), "in-progress")
+    }
+    for (const good of [
+        "https://sso.ciwgserver.com/application/o/authorize/?client_id=x&state=y&redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2Fcallback",
+        "http://127.0.0.1:5555/authorize?state=y",
+    ]) {
+        write(good)
+        assert.equal(readAutoLoginMarker({ now }).url, good)
+    }
+    assert.equal(isEndpointUrl("http://localhost:1/x"), true)
+    assert.equal(isEndpointUrl("http://example.com/x"), false)
+    assert.equal(isEndpointUrl(undefined), false)
+    rmSync(markerPath)
+})
+
+test("signInCooldownMs: a tool-triggered sign-in backs off 5 → 10 → 20 → 40 → 60 min per server process and stays capped at an hour", () => {
+    assert.deepEqual(
+        [1, 2, 3, 4, 5, 6, 40].map((attempt) => signInCooldownMs(attempt) / 60_000),
+        [5, 10, 20, 40, 60, 60, 60]
+    )
+    assert.equal(signInCooldownMs(0), 5 * 60_000, "a nonsense count never yields a zero cooldown")
+})
+
 // -------------------------------------------------- in-process (MCP path)
 
 test("beginBackgroundLogin: returns the authorize URL at once, finishes the loopback flow in the background, cleans up", async () => {
@@ -309,6 +373,9 @@ test("beginBackgroundLogin: a flow that times out reports a failure without thro
     assert.equal(readAuth(), null)
 
     // A hung IdP: the URL promise still settles (null) inside urlTimeoutMs.
+    // (Fresh state: the timed-out attempt above DID have a link and stamped
+    // the cadence — that is the contrast this leg asserts.)
+    rmSync(join(ciwgDir, "state.json"), { force: true })
     idpHang = true
     const t0 = Date.now()
     const stuck = beginBackgroundLogin({ urlTimeoutMs: 300, timeoutMs: 1_000 })
@@ -318,6 +385,61 @@ test("beginBackgroundLogin: a flow that times out reports a failure without thro
     idp.closeAllConnections?.()
     const failed = await stuck.done
     assert.equal(failed.ok, false)
+    // No link ever existed, so no tab: the daily cadence is NOT stamped —
+    // the next session start may try again (the error is still on record).
+    assert.equal(readState().auto_login_at, undefined)
+    assert.match(readState().auto_login_error, /./)
+    assert.match(describeAuthStatus(), /retries at the next session start/)
+})
+
+test("beginBackgroundLogin: two attempts racing on one machine open ONE browser — the loser follows the winner's marker, relays its link and settles when its sign-in lands", async () => {
+    const opened = []
+    const openBrowser = async (u) => {
+        opened.push(u)
+    }
+    const winner = beginBackgroundLogin({ urlTimeoutMs: 3_000, timeoutMs: 10_000, openBrowser })
+    const loser = beginBackgroundLogin({ urlTimeoutMs: 3_000, timeoutMs: 10_000, openBrowser })
+    const [url, relayed] = await Promise.all([winner.url, loser.url])
+    assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/authorize\?/)
+    assert.equal(relayed, url, "the loser relays the winner's link — it never made one of its own")
+    await sleep(50) // the winner's browser launch is a microtask behind onAuthorizeUrl
+    assert.equal(opened.length, 1, "exactly one browser launch")
+    assert.equal(readAutoLoginMarker().pid, process.pid)
+
+    assert.equal(await completeSignIn(url), 200)
+    const [w, l] = await Promise.all([winner.done, loser.done])
+    assert.equal(w.ok, true)
+    assert.equal(w.sibling, undefined)
+    assert.deepEqual(
+        { ok: l.ok, sibling: l.sibling, email: l.email, hasRefreshToken: l.hasRefreshToken },
+        { ok: true, sibling: true, email: "auto@ciwebgroup.com", hasRefreshToken: true }
+    )
+    assert.equal(opened.length, 1, "still one")
+    assert.equal(tokenCalls, 1, "one code exchange")
+    assert.ok(!existsSync(markerPath))
+})
+
+test("beginBackgroundLogin: a follower whose sibling ends without a sign-in reports that, opens nothing and stamps nothing", async () => {
+    // The "sibling" is this very process holding the marker (no url yet).
+    assert.equal(claimAutoLogin(), true)
+    const opened = []
+    const t0 = Date.now()
+    const follower = beginBackgroundLogin({
+        urlTimeoutMs: 300,
+        timeoutMs: 10_000,
+        openBrowser: async (u) => opened.push(u),
+    })
+    assert.equal(await follower.url, null, "the sibling never published a link")
+    assert.ok(Date.now() - t0 < 2_000)
+    releaseAutoLogin() // the sibling gives up
+    const result = await follower.done
+    assert.equal(result.ok, false)
+    assert.equal(result.sibling, true)
+    assert.match(result.error, /another session/)
+    assert.equal(opened.length, 0)
+    assert.equal(readState().auto_login_at, undefined, "a follower never stamps the cadence")
+    assert.equal(readState().auto_login_error, undefined, "…nor records an error that is not its own")
+    assert.ok(!existsSync(markerPath))
 })
 
 // --------------------------------------------------- detached (hook path)
@@ -429,19 +551,40 @@ test("SessionStart hook: opted out / headless / CI / legacy token → never open
     assert.ok(!existsSync(markerPath))
 })
 
-test("SessionStart hook: a hung sign-in server never holds the hook — it returns inside its budget without the link", async () => {
+test("SessionStart hook: a hung sign-in server never holds the hook — it returns inside its budget, names the manual path instead of promising a tab, and does not spend the day's attempt", async () => {
     idpHang = true
     try {
         const { out, elapsed } = await runHook("session-brief.mjs", startPayload("s-9"))
         assert.ok(out)
-        assert.equal(out.systemMessage, AUTO_LOGIN_MESSAGE, "no URL to show yet")
+        assert.equal(out.systemMessage, AUTO_LOGIN_MESSAGE_NO_URL, "no URL to show yet → '— or run /ciwg-login'")
+        assert.ok(out.systemMessage.startsWith(AUTO_LOGIN_MESSAGE))
+        assert.match(out.systemMessage, /\/ciwg-login/)
         assert.equal(out.hookSpecificOutput.additionalContext, AUTO_LOGIN_CONTEXT)
         assert.ok(elapsed < 6_000, `hook took ${elapsed}ms`)
         assert.ok(readAutoLoginMarker(), "the child is still trying")
+        assert.equal(readState().auto_login_at, undefined, "no link, no tab: the daily cadence is NOT stamped — the next start may retry")
     } finally {
         idpHang = false
         idp.closeAllConnections?.()
     }
+})
+
+test("SessionStart hook: only a real startup opens a browser — a resumed session gets the one-line hint at most, and stays silent while a sibling's browser is open", async () => {
+    const { out } = await runHook("session-brief.mjs", { session_id: "s-resume", cwd: fakeHome, source: "resume" })
+    assert.ok(out, "the hint still fires")
+    assert.equal(out.systemMessage, undefined, "no browser")
+    assert.match(out.hookSpecificOutput.additionalContext, /\/ciwg-login/)
+    assert.ok(!existsSync(markerPath), "no child spawned")
+    assert.equal(readState().auto_login_at, undefined)
+
+    rmSync(join(ciwgDir, "state.json"), { force: true })
+    assert.equal(claimAutoLogin(), true)
+    assert.equal(
+        (await runHook("session-brief.mjs", { session_id: "s-resume-2", cwd: fakeHome, source: "resume" })).out,
+        null,
+        "a sibling's sign-in is open: a resume neither nags nor opens another"
+    )
+    releaseAutoLogin()
 })
 
 // ------------------------------------------------- MCP server (real process)

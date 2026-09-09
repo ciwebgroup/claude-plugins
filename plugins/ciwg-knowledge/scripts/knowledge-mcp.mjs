@@ -12,9 +12,11 @@
  * finds auth.json. Opt-out / headless sessions get the manual hint.
  *
  * Where this runs: Claude Code (terminal and the desktop app's Code tab).
- * Claude Desktop's chat and Cowork do NOT launch a plugin's local stdio
- * server — the Desktop package of this plugin bundles the remote SSO
- * connector instead (tools/package.mjs).
+ * Cowork and Claude Desktop's chat do NOT launch a plugin's local stdio
+ * server — the Desktop package of this plugin declares the remote SSO
+ * connector instead (tools/package.mjs). Whether a chat surface honours
+ * that declaration from an uploaded plugin is unverified (the docs
+ * disagree); the README documents the custom-connector route for chat.
  *
  * Raw newline-delimited JSON-RPC over stdio; no SDK dependency so the
  * plugin needs no install step.
@@ -28,7 +30,12 @@
 
 import { readFileSync } from "node:fs"
 import { createInterface } from "node:readline"
-import { autoLoginDecision, beginBackgroundLogin, readAutoLoginMarker } from "./lib/auth.mjs"
+import {
+    autoLoginDecision,
+    beginBackgroundLogin,
+    readAutoLoginMarker,
+    signInCooldownMs,
+} from "./lib/auth.mjs"
 import {
     describeFailure,
     getSourceArtifacts,
@@ -53,9 +60,6 @@ const toolOpts = () => ({
 })
 /** How long a tool call may wait for the sign-in's authorize URL. */
 const SIGN_IN_URL_WAIT_MS = 2_000
-/** A tool-triggered browser sign-in is not repeated more often than this
- * from one server process (the model may retry a tool several times). */
-const SIGN_IN_COOLDOWN_MS = 5 * 60_000
 
 /** One version string for the plugin: plugin.json is the source. */
 function pluginVersion() {
@@ -135,7 +139,16 @@ const SIGN_IN_STATUSES = new Set(["no-token", "relogin"])
 
 /** The sign-in this process started, while it runs. */
 let pendingSignIn = null
-let lastSignInAt = 0
+/**
+ * A tool-triggered browser sign-in is not repeated from one server process
+ * more often than a GROWING cooldown allows (auth.mjs signInCooldownMs:
+ * 5 → 10 → 20 → 40 → 60 min, capped): the model may retry a tool several
+ * times, and a user who closed the tab must not get a fresh one every
+ * five minutes for as long as the server lives. A sign-in that lands
+ * resets the count.
+ */
+let signInAttempts = 0
+let signInBlockedUntil = 0
 
 const signInOpened = (url) =>
     "Company knowledge needs a one-time CIWG SSO sign-in — it was just opened in your browser. " +
@@ -158,22 +171,29 @@ async function signInOnDemand(status) {
     const now = Date.now()
     const decision = autoLoginDecision(status, { now })
     if (decision === "in-progress") {
+        // readAutoLoginMarker only ever hands back an https / loopback link.
         const marker = readAutoLoginMarker({ now })
         return text(marker?.url ? `${SIGN_IN_PENDING}\nLink: ${marker.url}` : SIGN_IN_PENDING)
     }
     // "recent" (the daily hook cadence) is not binding for an explicit tool
     // call — the user just asked for knowledge — but this process does not
-    // reopen the browser more than once per cooldown.
-    const allowed =
-        (decision === "due" || decision === "recent") && now - lastSignInAt >= SIGN_IN_COOLDOWN_MS
+    // reopen the browser more than the growing cooldown allows.
+    const allowed = (decision === "due" || decision === "recent") && now >= signInBlockedUntil
     if (!allowed) return errText(describeFailure(status))
-    lastSignInAt = now
+    signInAttempts += 1
+    signInBlockedUntil = now + signInCooldownMs(signInAttempts)
+    // beginBackgroundLogin never opens a second tab when a sibling process
+    // already owns the attempt — it relays that link and follows its result.
     const attempt = beginBackgroundLogin({ urlTimeoutMs: SIGN_IN_URL_WAIT_MS, log: debug })
     pendingSignIn = attempt
     attempt.done.then((result) => {
         pendingSignIn = null
         // The credential memo must not hand back the pre-login failure.
         resetCredentialMemo()
+        if (result.ok) {
+            signInAttempts = 0
+            signInBlockedUntil = 0
+        }
         debug("on-demand sign-in finished:", result.ok ? result.email : result.error)
     })
     const url = await attempt.url

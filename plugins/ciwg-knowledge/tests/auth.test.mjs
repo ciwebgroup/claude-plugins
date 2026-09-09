@@ -42,12 +42,17 @@ const savedEnv = {
     CIWG_KNOWLEDGE_TOKEN: process.env.CIWG_KNOWLEDGE_TOKEN,
     CIWG_KNOWLEDGE_URL: process.env.CIWG_KNOWLEDGE_URL,
     CIWG_OIDC_CLIENT_ID: process.env.CIWG_OIDC_CLIENT_ID,
+    CIWG_AUTO_LOGIN: process.env.CIWG_AUTO_LOGIN,
 }
 process.env.HOME = fakeHome
 process.env.USERPROFILE = fakeHome
 delete process.env.CIWG_KNOWLEDGE_TOKEN
 // The default-client-id assertion below must not see a shell override.
 delete process.env.CIWG_OIDC_CLIENT_ID
+// A shell that exports CIWG_AUTO_LOGIN=off (automation, a cautious
+// developer) must not change what --status and logout report in here: the
+// opt-out is exercised per test through explicit env, never inherited.
+delete process.env.CIWG_AUTO_LOGIN
 // Belt and braces: even a bug that reached the API would hit a dead port.
 process.env.CIWG_KNOWLEDGE_URL = "http://127.0.0.1:9"
 

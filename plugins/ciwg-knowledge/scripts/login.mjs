@@ -14,7 +14,8 @@
  *   --auto            the AUTOMATIC sign-in helper the SessionStart hook
  *                     spawns detached (see lib/auth.mjs "automatic login"):
  *                     silent, claims ~/.ciwg/auto-login.json, publishes the
- *                     authorize URL there, runs the browser flow, exits.
+ *                     authorize URL there (stamping the daily cadence at
+ *                     that moment), runs the browser flow, exits.
  *                     Never prints; never runs when opted out or headless
  *   --status          who is signed in, token validity, legacy-token presence
  *   --help
@@ -35,6 +36,7 @@ import {
     loginWithDeviceCode,
     looksHeadless,
     markAutoLoginFailed,
+    markAutoLoginStarted,
     publishAutoLoginUrl,
     readAuth,
     releaseAutoLogin,
@@ -76,7 +78,11 @@ async function deferredDeviceStart() {
  * hook checked them too, but the child may start seconds later): a legacy
  * token or an existing sign-in means nothing to do; opt-out and headless
  * never open a browser; a live sibling attempt (marker) is not duplicated.
- * The daily cadence is NOT re-checked — the spawner stamped it on purpose.
+ * The daily cadence is stamped HERE, the moment the authorize URL exists
+ * and just before the browser opens — not by the spawner: a child that
+ * never reaches the sign-in server leaves the cadence alone, so the next
+ * session start may try again instead of waiting a day (the spawner's
+ * own "in-progress" check on the marker is what stops a second tab).
  */
 async function autoLogin() {
     if (getLegacyToken() || readAuth()) return
@@ -86,7 +92,10 @@ async function autoLogin() {
         await loginWithBrowser({
             timeoutMs: AUTO_LOGIN_TIMEOUT_MS,
             log: debug,
-            onAuthorizeUrl: (url) => publishAutoLoginUrl(url),
+            onAuthorizeUrl: (url) => {
+                markAutoLoginStarted()
+                publishAutoLoginUrl(url)
+            },
         })
     } catch (error) {
         markAutoLoginFailed(error?.message ?? error)

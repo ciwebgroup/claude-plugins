@@ -7,8 +7,13 @@
  *     login"): it tells the user in one line, gives Claude one line of
  *     context, and returns within its budget — the sign-in finishes in the
  *     background and the next prompt's hooks find the credential. At most
- *     once a day; never on SSH/headless/CI or when opted out — those get
- *     the old one-line "/ciwg-login" nudge (once a day / once per session);
+ *     once a day, and ONLY on a real session startup (payload source
+ *     "startup" — a resume, compact or clear never opens anything); never
+ *     on SSH/headless/CI or when opted out — those get the old one-line
+ *     "/ciwg-login" nudge (once a day / once per session). Automation
+ *     that starts sessions (`claude -p`, cron) also reports "startup":
+ *     it must set CIWG_AUTO_LOGIN=off (README) — there is no payload
+ *     field that tells an unattended run from a person at a terminal;
  *   - the API rejected the SSO token (401) → an actionable line, once per
  *     session (the server may not trust this app yet).
  *
@@ -33,6 +38,7 @@
 import {
     AUTO_LOGIN_CONTEXT,
     AUTO_LOGIN_MESSAGE,
+    AUTO_LOGIN_MESSAGE_NO_URL,
     autoLoginDecision,
     signInHint,
     spawnAutoLogin,
@@ -67,19 +73,27 @@ async function hint(additionalContext, systemMessage) {
 }
 
 /**
- * No credential: open the browser sign-in ourselves when that is due, else
- * fall back to the one-line nudge. Exits the process either way.
+ * No credential: open the browser sign-in ourselves when that is due (and
+ * this is a real startup), else fall back to the one-line nudge. Exits the
+ * process either way.
  */
-async function handleNoCredential(status, sessionId, deadline) {
-    const decision = autoLoginDecision(status)
+async function handleNoCredential(status, sessionId, source, deadline) {
+    let decision = autoLoginDecision(status)
+    // Only a real session startup opens a browser: a resumed session had
+    // its chance when it started, and a compaction/clear is not a start
+    // at all. (Unattended runs — `claude -p`, cron — also say "startup";
+    // they opt out with CIWG_AUTO_LOGIN=off, see the file header.)
+    if (decision === "due" && source !== "startup") decision = "not-startup"
     debug("no usable credential:", status, "— auto-login:", decision)
     if (decision === "due") {
         const waitMs = Math.max(0, Math.min(2_500, remainingMs(deadline) - AUTO_LOGIN_RESERVE_MS))
         const { started, url } = await spawnAutoLogin({ waitMs })
         if (started) {
+            // No link yet = the helper had not reached the sign-in server
+            // when we had to answer: promise nothing, name the manual path.
             const message = url
                 ? `${AUTO_LOGIN_MESSAGE} If it did not open, visit:\n${url}`
-                : AUTO_LOGIN_MESSAGE
+                : AUTO_LOGIN_MESSAGE_NO_URL
             await hint(AUTO_LOGIN_CONTEXT, message)
         }
     } else if (decision === "in-progress") {
@@ -102,7 +116,7 @@ try {
     // if needed); the API calls below share the memoised result.
     const auth = await resolveCredential({ deadline, refreshWithinMs: PROACTIVE_REFRESH_MS })
     if (!auth.ok) {
-        await handleNoCredential(auth.status, payload.session_id, deadline)
+        await handleNoCredential(auth.status, payload.session_id, payload.source, deadline)
     }
 
     const mapping = getClientMapping(payload.cwd)

@@ -17,6 +17,24 @@ import { fileURLToPath } from "node:url"
 
 const pluginDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 const repoRoot = join(pluginDir, "..", "..")
+
+// The production connector URL / client id are asserted below; a shell
+// that points the plugin at a staging API or IdP (CIWG_KNOWLEDGE_URL,
+// CIWG_OIDC_CLIENT_ID — the test harness exports a loopback API URL so
+// nothing can dial out) must not change what the packages default to.
+const savedEnv = {
+    CIWG_KNOWLEDGE_URL: process.env.CIWG_KNOWLEDGE_URL,
+    CIWG_OIDC_CLIENT_ID: process.env.CIWG_OIDC_CLIENT_ID,
+}
+delete process.env.CIWG_KNOWLEDGE_URL
+delete process.env.CIWG_OIDC_CLIENT_ID
+after(() => {
+    for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+    }
+})
+
 const { createZip, readZip, crc32 } = await import("../../../tools/lib/zip.mjs")
 const { buildAll, buildCodePackage, buildDesktopPackage } = await import("../../../tools/package.mjs")
 const { OIDC_CLIENT_ID } = await import("../scripts/lib/auth.mjs")
@@ -46,6 +64,34 @@ test("zip: round-trips names and bytes (store + deflate), CRCs verified, unsafe 
     assert.equal(crc32(Buffer.from("123456789")), 0xcbf43926, "CRC-32 check value")
     assert.throws(() => createZip([{ name: "../evil", data: "" }]), /invalid zip entry/)
     assert.throws(() => readZip(Buffer.from("not a zip")), /not a zip/)
+})
+
+test("zip: a directory record precedes the first file in each directory (portable extractors); readZip skips them unless asked; still deterministic", () => {
+    const files = [
+        { name: "a/b/c.txt", data: "x" },
+        { name: "a/d.txt", data: "y" },
+        { name: "top.txt", data: "z" },
+        { name: "a/b/e.txt", data: "w" },
+    ]
+    const buf = createZip(files)
+    assert.deepEqual(
+        readZip(buf).map((e) => e.name),
+        ["a/b/c.txt", "a/d.txt", "top.txt", "a/b/e.txt"],
+        "caller order kept, directories hidden by default"
+    )
+    const all = readZip(buf, { directories: true })
+    assert.deepEqual(
+        all.map((e) => e.name),
+        ["a/", "a/b/", "a/b/c.txt", "a/d.txt", "top.txt", "a/b/e.txt"],
+        "each directory once, before its first file"
+    )
+    assert.deepEqual(
+        all.filter((e) => e.isDirectory).map((e) => [e.name, e.data.length]),
+        [["a/", 0], ["a/b/", 0]]
+    )
+    assert.ok(createZip(files).equals(buf), "byte-identical rebuild")
+    assert.ok(!createZip(files, { directories: false }).equals(buf))
+    assert.deepEqual(readZip(createZip(files, { directories: false }), { directories: true }).map((e) => e.name), files.map((f) => f.name))
 })
 
 test("plugin.json: version pinned at 0.3.0 (semver) — users only receive updates when it is bumped", () => {
@@ -94,6 +140,12 @@ test("Claude Code package: manifest + hooks + local MCP server + skill + command
     for (const e of back) {
         assert.ok(entry(pkg, e.name).data.equals(Buffer.isBuffer(e.data) ? e.data : Buffer.from(e.data)))
     }
+    // …and carries the folder records extractors that need them expect.
+    const dirs = readZip(pkg.buffer, { directories: true }).filter((e) => e.isDirectory).map((e) => e.name)
+    for (const dir of [".claude-plugin/", "hooks/", "scripts/", "scripts/lib/", "skills/company-knowledge/"]) {
+        assert.ok(dirs.includes(dir), `directory record ${dir}`)
+    }
+    assert.deepEqual(pkg.surfaces, ["claude-code"])
 })
 
 test("Claude Desktop package: no hooks, no local server — the remote SSO connector (.mcp.json http + oauth clientId) and the skill", async () => {
@@ -127,6 +179,18 @@ test("Claude Desktop package: no hooks, no local server — the remote SSO conne
     assert.match(readme, /Customize → Plugins → Add plugin → Upload plugin/)
     assert.match(readme, /Connect/)
     assert.match(readme, new RegExp(`v${manifest.version.replace(/\./g, "\\.")}`))
+    // Honest scope: Cowork is documented; chat is unverified and gets the
+    // custom-connector route (URL + client id) instead of a promise.
+    assert.match(readme, /Claude Cowork plugin/)
+    assert.match(readme, /chat — unverified/)
+    assert.match(readme, /Settings → Connectors → Add custom connector/)
+    assert.ok(readme.includes(`URL \`${API_BASE}/mcp\``))
+    assert.ok(readme.includes(OIDC_CLIENT_ID))
+    assert.doesNotMatch(readme, /Claude Desktop \/ claude\.ai plugin/)
+    assert.deepEqual(pkg.surfaces, ["cowork"])
+    assert.deepEqual(pkg.unverified, ["claude-desktop-chat", "claude.ai-chat"])
+    assert.match(pkg.note, /^VERIFY ON FIRST UPLOAD/)
+    assert.ok(pkg.note.includes(`${API_BASE}/mcp`) && pkg.note.includes(OIDC_CLIENT_ID))
     // The skill is byte-identical to the source.
     assert.ok(
         entry(pkg, "skills/company-knowledge/SKILL.md").data.equals(
@@ -161,6 +225,18 @@ test("buildAll: writes both zips, release.json and SHA256SUMS that agree; rebuil
     }
     const onDisk = JSON.parse(readFileSync(join(outDir, "release.json"), "utf8"))
     assert.deepEqual(onDisk, release)
+    // The "verify on first upload" note travels with the Desktop asset; the
+    // Node line the digests were produced on is recorded.
+    const desktop = release.assets.find((a) => a.target === "desktop")
+    assert.deepEqual(desktop.surfaces, ["cowork"])
+    assert.deepEqual(desktop.unverified, ["claude-desktop-chat", "claude.ai-chat"])
+    assert.match(desktop.note, /VERIFY ON FIRST UPLOAD/)
+    assert.match(desktop.note, /Add custom connector/)
+    assert.ok(desktop.note.includes(OIDC_CLIENT_ID))
+    const code = release.assets.find((a) => a.target === "code")
+    assert.deepEqual(code.surfaces, ["claude-code"])
+    assert.equal(code.note, undefined)
+    assert.equal(release.built_with.node, process.versions.node)
 
     const again = await buildAll({ outDir })
     assert.deepEqual(again, release, "deterministic: same digests on rebuild")

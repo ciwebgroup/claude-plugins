@@ -4,8 +4,9 @@ Company knowledge, injected — not fetched. This plugin wires CIWG's
 knowledge engine into Claude: in **Claude Code**, hooks query the knowledge
 API before Claude sees your prompt and inject compact, source-cited
 snippets (the model spends zero tokens deciding whether to look something
-up); in **Claude Desktop / claude.ai / Cowork**, the bundled connector and
-a skill make Claude search company knowledge first and cite its sources.
+up); in **Claude Cowork** (plugin upload) and in **claude.ai / Claude
+Desktop chat** (custom connector), the remote connector and a skill make
+Claude search company knowledge first and cite its sources.
 
 Ingested sources today: call transcripts, chat logs, Fathom meetings.
 Helpdesk tickets, internal team chat and org notes light up automatically
@@ -15,20 +16,45 @@ as their ingestion ships — no plugin update needed.
 SSO login (Authentik, MFA included), once. Access is tied to your staff
 membership and ends within minutes of removal from Authentik.
 
-## Install — two paths, three steps each
+## Install — three paths, three steps each
 
 Get the zip for your Claude from the synapse **AI Tools** page (staff
 sign-in) — it always serves the latest release — or from this repo's
 [Releases](https://github.com/ciwebgroup/claude-plugins/releases).
 
-### Claude Desktop, claude.ai, Cowork → `ciwg-knowledge-desktop-<version>.zip`
+### Claude Cowork → `ciwg-knowledge-desktop-<version>.zip`
 
-1. Open **Customize → Plugins → Add plugin → Upload plugin** and choose the
-   zip (Claude accepts `.zip` only).
+Cowork runs an uploaded plugin's skills, connectors and hooks (verified
+against Anthropic's docs, 2026-09-09 — see "What runs where").
+
+1. In Claude Desktop open **Customize → Plugins → Add plugin → Upload
+   plugin** and choose the zip (Claude accepts `.zip` only).
 2. Open the installed plugin, find the **CIWG Knowledge** connector and
    click **Connect**. Sign in with CIWG SSO and approve access.
 3. Done. Ask about a client, a meeting or a decision — Claude searches
    company knowledge first and cites `[source]` pointers.
+
+**Claude Desktop chat / claude.ai chat: unverified until a real upload
+test.** Anthropic's docs disagree with each other: the support article
+says a plugin's skills and connectors work in chat, while the Claude
+Desktop plugin docs say "Connectors declared by a plugin you add yourself
+are not added to Claude Desktop's connectors". Nobody has uploaded this
+zip into a chat surface yet. Until someone does and sees **CIWG Knowledge**
+appear under Connectors, use the custom-connector path below for chat (and
+if the upload turns out to work, say so in the release ticket so this
+section — and the note in `release.json` — can go).
+
+### claude.ai / Claude Desktop chat → custom connector (no zip)
+
+1. **Settings → Connectors → Add custom connector.**
+2. Name `CIWG Knowledge`, URL `https://api.ciwebgroup.com/mcp`; under
+   **Advanced settings** set **OAuth Client ID** to
+   `lVCIMgCq4SQiQAdqHUfg7UONaOISMbpHygQXcIe1` (public client — leave the
+   secret empty).
+3. Click **Connect**, sign in with CIWG SSO, approve. Done — same knowledge,
+   same sign-in, same tools (`search_company_knowledge`,
+   `get_source_artifacts`). Without the plugin's skill, ask Claude to
+   "search company knowledge" when it does not do so by itself.
 
 ### Claude Code (terminal, or the desktop app's Code tab) → `ciwg-knowledge-<version>.zip`
 
@@ -43,7 +69,14 @@ Needs Node.js ≥ 18 on your `PATH` (the hooks and the local server run with
 3. Done. Knowledge starts flowing from your next prompt.
 
 Alternatives for Claude Code: `claude --plugin-dir ~/Downloads/ciwg-knowledge-<version>.zip`
-loads the zip for one session; developers with GitHub access to this repo
+loads a downloaded zip for one session; `claude --plugin-url <zip url>`
+fetches one for the session without downloading first. The fetch is a
+plain unauthenticated GET, so the URL must serve the zip that way — the
+synapse proxy URL
+(`https://api.ciwebgroup.com/api/v1/knowledge/plugin-package?target=code`)
+qualifies only where it is reachable without your staff sign-in cookie,
+and a private-repo Releases asset does not; when in doubt, download the
+zip and use `--plugin-dir`. Developers with GitHub access to this repo
 can use the marketplace instead (updates arrive with `/plugin update`):
 
 ```
@@ -56,38 +89,47 @@ plugin's own `version` in `plugin.json` is what Claude Code reads).
 
 ## What you'll see
 
-- **First prompt (Claude Code):** one line — *Opening CIWG sign-in in your
+- **Session start (Claude Code):** one line — *Opening CIWG sign-in in your
   browser to connect company knowledge…* — and the SSO page opens once. If
-  it did not open, the line carries the link. Nothing blocks; sign in and
-  carry on. The browser opens at most once a day, never over SSH/CI, and
-  not when you have opted out (below). `/ciwg-login` is the manual path.
-- **First use (Desktop / claude.ai):** the connector's **Connect** button
-  once; the sign-in page opens in the browser.
+  it did not open, the line carries the link (or, when the helper had not
+  reached the sign-in server yet, *— or run /ciwg-login if nothing opens*).
+  Nothing blocks; sign in and carry on. The browser opens at most once a
+  day, only when a session really starts (never on resume, compaction or
+  clear), never over SSH/CI, and not when you have opted out (below).
+  `/ciwg-login` is the manual path. **Automation** — `claude -p`, cron,
+  scripted sessions — looks like a startup too: set `CIWG_AUTO_LOGIN=off`
+  there (a legacy token, "Legacy API tokens" below, also disables it).
+- **First use (Cowork / custom connector):** the connector's **Connect**
+  button once; the sign-in page opens in the browser.
 - **Re-sign-in:** only when Authentik says so — your CIWG session expired
   (refresh token lapsed, default 30 days) or an admin removed your access.
-  In Claude Code the next session opens the sign-in again by itself (once
-  a day); in Desktop the connector shows **Connect** again.
+  In Claude Code the next session start opens the sign-in again by itself
+  (once a day); on a connector it shows **Connect** again.
 - **Nothing else.** No tokens to paste, nothing to rotate, nothing to
   clean up when someone leaves.
 
 ## What runs where (verified against Anthropic's docs, 2026-09-09)
 
-| Component | Claude Code | Claude Desktop chat / claude.ai | Cowork |
+| Component | Claude Code | Cowork (plugin upload) | Claude Desktop chat / claude.ai chat |
 |---|---|---|---|
-| Hooks (auto-injection before each prompt, session brief, engram) | yes | **no** — "Hooks and sub-agents run only in Cowork, so they appear grayed out in chat" ([Use plugins in Claude](https://support.claude.com/en/articles/13837440-use-plugins-in-claude)) | yes, inside the Cowork VM |
-| Local stdio MCP server (`scripts/knowledge-mcp.mjs`, `node`) | yes | **no** — a plugin's local server never runs in chat; Desktop plugins declare connectors in `.mcp.json` as `http`/`sse` only ([Claude Desktop extensions reference](https://claude.com/docs/third-party/claude-desktop/extensions)) | not relied on |
-| Remote SSO connector (`https://api.ciwebgroup.com/mcp`) | optional (`claude mcp add`, needs the `localhost` redirect regex) | **yes** — bundled in the Desktop zip's `.mcp.json` | yes |
-| `company-knowledge` skill | yes | yes | yes |
+| Hooks (auto-injection before each prompt, session brief, engram) | yes | yes, inside the Cowork VM | **no** — "Hooks and sub-agents run only in Cowork, so they appear grayed out in chat" ([Use plugins in Claude](https://support.claude.com/en/articles/13837440-use-plugins-in-claude)) |
+| Local stdio MCP server (`scripts/knowledge-mcp.mjs`, `node`) | yes | **no** — never runs there; Desktop plugins declare connectors in `.mcp.json` as `http`/`sse` only ([Claude Desktop extensions reference](https://claude.com/docs/third-party/claude-desktop/extensions)) | **no** — "a local MCP server declared by a plugin never runs" ([Plugins in Claude Desktop](https://claude.com/docs/government/desktop/plugins)) |
+| Remote SSO connector (`https://api.ciwebgroup.com/mcp`) | optional (`claude mcp add`, needs the `localhost` redirect regex) | **yes** — declared in the Desktop zip's `.mcp.json`; "In Cowork, connectors reach external services through Anthropic's cloud" (support article) | **unverified from a plugin upload** — the support article says plugin connectors work in chat, the Desktop plugin docs say "Connectors declared by a plugin you add yourself are not added to Claude Desktop's connectors". **Verified path: the custom connector** (Install, above) |
+| `company-knowledge` skill | yes | yes | per the support article yes ("the skills bundled in a plugin work across all three") — unverified here, same upload test |
 | `/ciwg-login`, `/ciwg-logout` | yes | n/a (Connect / Disconnect on the connector) | n/a |
 
 That is why one source builds two zips (`npm run package`): the Claude
 Code zip is the plugin as-is; the Desktop zip carries the remote connector
-plus the skill and nothing that cannot run there. Upload accepts `.zip`
-only ("choose the plugin's `.zip` file" — [Plugins in Claude Desktop](https://claude.com/docs/government/desktop/plugins);
+plus the skill and nothing that cannot run in Cowork. The chat column is
+an open question, not a promise: `release.json` carries a *verify on first
+upload* note on the Desktop asset for that reason, and the custom
+connector is the documented route for chat until the note is retired.
+Upload accepts `.zip` only ("choose the plugin's `.zip` file" — [Plugins in Claude Desktop](https://claude.com/docs/government/desktop/plugins);
 the plugin must sit at the archive root with `.claude-plugin/plugin.json`,
 a single wrapping folder tolerated). Claude Code's `claude plugin install`
-takes marketplace names only; a local zip loads via `--plugin-dir` or by
-living under `~/.claude/skills/` ([Plugins reference](https://code.claude.com/docs/en/plugins-reference)).
+takes marketplace names only; a local zip loads via `--plugin-dir`, a
+remote one via `--plugin-url`, or it auto-loads from under
+`~/.claude/skills/` ([Plugins reference](https://code.claude.com/docs/en/plugins-reference)).
 
 ## What you get (Claude Code)
 
@@ -111,19 +153,31 @@ token to the REST API (`/api/v1/knowledge/*`, `/api/v1/engram/*`) as
 `Authorization: Bearer`. The OAuth 2.1 client is written against
 node:crypto + node:http + fetch (no dependencies).
 
-- **Automatic sign-in (new in 0.3).** When a session starts without a
-  credential, the `SessionStart` hook spawns a detached
+- **Automatic sign-in (new in 0.3).** When a session *starts* (hook
+  payload `source: "startup"` — never on resume, compaction or clear)
+  without a credential, the `SessionStart` hook spawns a detached
   `login.mjs --auto`, waits up to ~2.5 s for it to publish the authorize
-  URL (`~/.ciwg/auto-login.json`, pid-checked so two sessions never open
-  two browsers), tells you *Opening CIWG sign-in…* (with the link) and
+  URL (`~/.ciwg/auto-login.json`), tells you *Opening CIWG sign-in…* (with
+  the link, or *— or run /ciwg-login* when the helper has no link yet) and
   returns; the child owns the loopback listener and finishes the flow.
-  The MCP server does the same in-process on a tool call. Cadence: once
-  a day per machine (`~/.ciwg/state.json` `auto_login_at`); a sign-out
-  holds it for a day too. Never on SSH/headless/CI. Opt out with
-  `CIWG_AUTO_LOGIN=off` or `"autoLogin": false` in `~/.ciwg/knowledge.json`
-  — then the old one-line "run /ciwg-login" nudge is all you see.
-  `CIWG_KNOWLEDGE_NO_BROWSER=1` keeps the flow but never launches a
-  browser (the link is shown instead).
+  The MCP server does the same in-process on a tool call (with a growing
+  per-process cooldown: 5 → 10 → 20 → 40 → 60 min between attempts, reset
+  by a sign-in that lands). One attempt per machine at a time: the marker
+  is claimed exclusively (`O_EXCL`, pid-checked; a half-written marker
+  counts as live for 5 s), and a process that loses the race — two
+  sessions, two MCP servers — *follows* the winner: it relays the same link
+  and picks up the credential when it lands, never a second tab. A link
+  from the marker is relayed only if it is https or loopback-http. Cadence:
+  once a day per machine (`~/.ciwg/state.json` `auto_login_at`), stamped
+  the moment the link exists — just before the tab opens — so an attempt
+  that never reached the sign-in server (no link, no tab) may be retried
+  at the next start instead of waiting a day; a sign-out holds it for a
+  day too. Never on SSH/headless/CI. Opt out with `CIWG_AUTO_LOGIN=off`
+  (do this for automation: `claude -p`, cron, anything unattended — those
+  report `startup` like a terminal does) or `"autoLogin": false` in
+  `~/.ciwg/knowledge.json` — then the old one-line "run /ciwg-login" nudge
+  is all you see. `CIWG_KNOWLEDGE_NO_BROWSER=1` keeps the flow but never
+  launches a browser (the link is shown instead).
 - **Primary flow — Authorization Code + PKCE with a loopback redirect.**
   A temporary listener is bound to `127.0.0.1` on a random port; the
   browser is opened at Authentik's authorize endpoint with
@@ -245,10 +299,20 @@ application's tokens (issuer + audience above) — `MCP_OAUTH_ISSUER` /
 
 `npm run package` (Node only, no dependencies) builds `dist/`:
 `ciwg-knowledge-<version>.zip`, `ciwg-knowledge-desktop-<version>.zip`,
-`release.json`, `SHA256SUMS` — deterministic (same commit → same bytes).
-Pushing to `main` with a new `version` in `.claude-plugin/plugin.json`
-creates the GitHub Release `ciwg-knowledge-v<version>` with those assets
-(`.github/workflows/release.yml`); the synapse AI Tools page serves them
+`release.json`, `SHA256SUMS` — deterministic: same commit **on the same
+Node major** → same bytes. The deflate output comes from the zlib bundled
+with Node, which changes between Node majors, so a rebuild on another Node
+line can legitimately differ; the published digests are CI's (Node 22 —
+compare local builds on Node 22 only; `release.json` records
+`built_with.node`). The zips carry directory records, so extractors that
+need them (Windows' built-in one, Java-based tools) create the folders.
+`release.json` also lists the surfaces each asset is documented for, and
+the Desktop asset carries the **verify on first upload** note about chat
+(see "What runs where"). Pushing to `main` with a new `version` in
+`.claude-plugin/plugin.json` creates the GitHub Release
+`ciwg-knowledge-v<version>` with those assets (`.github/workflows/release.yml`
+— the test job runs with a read-only token and no persisted credentials,
+only the release job may write); the synapse AI Tools page serves them
 through web-services (`GET /api/v1/knowledge/plugin-package?target=desktop|code`,
 staff-gated, using a read-only GitHub token because this repo is private).
 
@@ -262,14 +326,20 @@ staff-gated, using a read-only GitHub token because this repo is private).
   and device flows end to end, logout, the hint cadence, the hooks as real
   processes (hint path).
 - `autologin.test.mjs` — the automatic sign-in: decision rules (signed in
-  / opted out / headless / once a day / already running), the in-process
-  background login, the detached child, the SessionStart hook as a real
-  process (opens once, tells the user, stays inside its budget even with a
-  hung IdP, silent afterwards), the MCP server as a real process (friendly
-  message in ~2 s, then works after the sign-in).
-- `package.test.mjs` — both zips have the structure each surface expects,
-  metadata files agree, rebuilds are byte-identical, the CLI works.
+  / opted out / headless / once a day / already running), the marker
+  (torn-read safety, link validation), two attempts racing → one browser
+  (the loser follows the winner), the in-process background login, the
+  detached child, the SessionStart hook as a real process (opens once on a
+  real startup only — a resume gets the hint, tells the user, stays inside
+  its budget even with a hung IdP without spending the day's attempt,
+  silent afterwards), the MCP server as a real process (friendly message
+  in ~2 s, then works after the sign-in), the tool-call cooldown schedule.
+- `package.test.mjs` — both zips have the structure each surface expects
+  (directory records included), metadata files agree and carry the
+  verify-on-first-upload note, rebuilds are byte-identical, the CLI works.
 
 No network is touched — every call goes to a `127.0.0.1` server the test
 owns — no real browser is launched, and `~/.ciwg` is redirected to a temp
-dir for the run.
+dir for the run. The suite is hermetic against the shell: it passes with
+`CIWG_AUTO_LOGIN=off` (or a legacy token) exported, because every file
+scrubs those variables and asserts the opt-out through explicit env only.
