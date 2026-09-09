@@ -42,12 +42,17 @@ const savedEnv = {
     CIWG_KNOWLEDGE_TOKEN: process.env.CIWG_KNOWLEDGE_TOKEN,
     CIWG_KNOWLEDGE_URL: process.env.CIWG_KNOWLEDGE_URL,
     CIWG_OIDC_CLIENT_ID: process.env.CIWG_OIDC_CLIENT_ID,
+    CIWG_AUTO_LOGIN: process.env.CIWG_AUTO_LOGIN,
 }
 process.env.HOME = fakeHome
 process.env.USERPROFILE = fakeHome
 delete process.env.CIWG_KNOWLEDGE_TOKEN
 // The default-client-id assertion below must not see a shell override.
 delete process.env.CIWG_OIDC_CLIENT_ID
+// A shell that exports CIWG_AUTO_LOGIN=off (automation, a cautious
+// developer) must not change what --status and logout report in here: the
+// opt-out is exercised per test through explicit env, never inherited.
+delete process.env.CIWG_AUTO_LOGIN
 // Belt and braces: even a bug that reached the API would hit a dead port.
 process.env.CIWG_KNOWLEDGE_URL = "http://127.0.0.1:9"
 
@@ -1311,7 +1316,11 @@ test("logout: revokes the refresh token, wipes the cache and state, holds the fi
     assert.equal(state.relogin_hint_session, undefined)
     assert.ok(state.first_run_hint_at, "a deliberate sign-out is not a first run")
     assert.equal(signInHint("no-token", "s2"), null, "no nag right after signing out")
-    assert.equal(describeAuthStatus(), "SSO: not signed in — run /ciwg-login.")
+    const status = describeAuthStatus().split("\n")
+    assert.equal(status[0], "SSO: not signed in — run /ciwg-login.")
+    // Signing out also holds the automatic browser sign-in for a day.
+    assert.ok(state.auto_login_at, "auto-login held after a deliberate sign-out")
+    assert.match(status[1], /Automatic sign-in: held until/)
 
     // Nothing cached: a no-op, no network.
     const idle = mockFetch({})
@@ -1406,6 +1415,11 @@ function runHook(script, payload, extraEnv = {}) {
             USERPROFILE: fakeHome,
             CIWG_KNOWLEDGE_TOKEN: "",
             CIWG_KNOWLEDGE_URL: "http://127.0.0.1:9",
+            // These tests cover the HINT path; the automatic browser sign-in
+            // (autologin.test.mjs) must never spawn a child from here — it
+            // would dial the real issuer and open a real browser.
+            CIWG_AUTO_LOGIN: "off",
+            CIWG_KNOWLEDGE_NO_BROWSER: "1",
             ...extraEnv,
         },
         input: JSON.stringify(payload),

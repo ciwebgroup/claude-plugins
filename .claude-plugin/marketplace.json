@@ -8,7 +8,7 @@
         {
             "name": "ciwg-knowledge",
             "source": "./plugins/ciwg-knowledge",
-            "description": "Company knowledge auto-injection: relevant call transcripts, chat logs and Fathom meetings (tickets/team-chat/notes as their ingestion ships) flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Sign in once with CIWG SSO (/ciwg-login) — no API tokens. Includes explicit MCP search tools on the same sign-in."
+            "description": "Company knowledge auto-injection: relevant call transcripts, chat logs and Fathom meetings (tickets/team-chat/notes as their ingestion ships) flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Signs you in with CIWG SSO automatically on first use (no tokens; /ciwg-login is the manual fallback). Includes explicit MCP search tools and a company-knowledge skill on the same sign-in."
         }
     ]
 }

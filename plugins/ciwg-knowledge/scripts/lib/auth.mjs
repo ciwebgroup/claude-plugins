@@ -38,9 +38,11 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
     ciwgDir,
     debug,
+    ensureCiwgDir,
     escapeXml,
     fetchWithTimeout,
     readJson,
@@ -124,6 +126,8 @@ export const authPath = () => join(ciwgDir(), "auth.json")
 const lockPath = () => join(ciwgDir(), "auth.lock")
 const lockPidPath = () => join(lockPath(), "pid")
 const pendingPath = () => join(ciwgDir(), "auth-pending.json")
+/** A browser sign-in that is running right now (see "automatic login"). */
+const autoLoginPath = () => join(ciwgDir(), "auto-login.json")
 
 /** Injected into context by the hooks — one line each, once. They address
  * Claude (additionalContext is model-facing) and ask it to relay. */
@@ -136,6 +140,17 @@ export const LOGIN_HINT_API_REJECTED =
 /** The one sentence about a legacy token shadowing SSO — CLI and --status. */
 export const LEGACY_TOKEN_NOTE =
     "Note: a legacy API token is configured (CIWG_KNOWLEDGE_TOKEN or ~/.ciwg/knowledge.json) — the hooks use it instead of SSO until you remove it."
+/** Model-facing line when the SessionStart hook has just opened the browser
+ * sign-in by itself: Claude has nothing to do, but should know why the
+ * user's browser opened and what to say if asked. */
+export const AUTO_LOGIN_CONTEXT =
+    "ciwg-knowledge: a CIWG SSO sign-in page is being opened in the user's browser to connect company knowledge (one-time; nothing to do in this session). If the user asks, tell them to finish signing in there — company knowledge connects automatically from their next prompt. If the browser did not open, /ciwg-login prints the link."
+/** User-facing (systemMessage) line for the same moment. */
+export const AUTO_LOGIN_MESSAGE = "Opening CIWG sign-in in your browser to connect company knowledge…"
+/** Same moment, but the helper had not reached the sign-in server yet when
+ * the hook had to answer — so there is no link to show and no promise that
+ * a tab WILL open: name the manual path in the same breath. */
+export const AUTO_LOGIN_MESSAGE_NO_URL = `${AUTO_LOGIN_MESSAGE} — or run /ciwg-login if nothing opens.`
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -337,7 +352,9 @@ function tokenResponseToAuth(tokens, previous, meta, now) {
 
 // -------------------------------------------------------------- transport
 
-const isEndpointUrl = (value) =>
+/** https anywhere, or plain http on the loopback host only (a local test
+ * IdP) — the shape every URL this module dials or relays must have. */
+export const isEndpointUrl = (value) =>
     typeof value === "string" &&
     /^https:\/\/|^http:\/\/(127\.0\.0\.1|localhost)(:|\/)/.test(value)
 
@@ -829,11 +846,20 @@ export function browserLaunchSpec(url, platform = process.platform) {
     return { command: "xdg-open", args: [url] }
 }
 
+/** CIWG_KNOWLEDGE_NO_BROWSER=1: never launch a browser — print/relay the
+ * URL only (kiosk machines, remote desktops, and the tests). */
+const browserSuppressed = (env = process.env) =>
+    /^(1|true|yes|on)$/i.test((env.CIWG_KNOWLEDGE_NO_BROWSER ?? "").trim())
+
 /** Open a URL in the default browser, detached; rejects if no opener. */
 function openInBrowser(url) {
     return new Promise((resolve, reject) => {
         if (!/^https?:\/\/[^\s"'<>]+$/.test(url)) {
             reject(new Error("refusing to open a non-http URL"))
+            return
+        }
+        if (browserSuppressed()) {
+            reject(new Error("browser launch disabled (CIWG_KNOWLEDGE_NO_BROWSER)"))
             return
         }
         const { command, args } = browserLaunchSpec(url)
@@ -874,7 +900,7 @@ function finishLogin(tokens, meta, clientId, now, log) {
     }
     writeAuth(auth) // a login that cannot persist IS a failure — let it throw
     rmQuiet(pendingPath())
-    pruneState(["relogin", "api_rejected", "idp_down"])
+    pruneState(["relogin", "api_rejected", "idp_down", "auto_login"])
     return {
         email: auth.email,
         expiresAt: auth.expires_at,
@@ -886,7 +912,10 @@ function finishLogin(tokens, meta, clientId, now, log) {
  * Authorization Code + PKCE with a loopback redirect — the primary flow.
  * Opens the browser (or prints the URL), waits for the single callback,
  * exchanges the code, persists the tokens. Resolves {email, expiresAt,
- * hasRefreshToken}.
+ * hasRefreshToken}. `onAuthorizeUrl(url)` fires as soon as the listener is
+ * up and the authorize URL exists — before the browser is launched — so a
+ * caller that must answer quickly (a hook, a tool call) can relay the link
+ * while the sign-in itself keeps running.
  */
 export async function loginWithBrowser({
     issuer = OIDC_ISSUER,
@@ -896,6 +925,7 @@ export async function loginWithBrowser({
     openBrowser = openInBrowser,
     timeoutMs = 180_000,
     log = () => {},
+    onAuthorizeUrl = () => {},
     now = Date.now,
 } = {}) {
     const meta = await discover(issuer, { fetchImpl })
@@ -914,6 +944,11 @@ export async function loginWithBrowser({
         authorizeUrl.searchParams.set("code_challenge_method", pkce.method)
         log("Opening your browser to sign in with CIWG SSO…")
         log(`If it does not open, visit:\n  ${authorizeUrl}`)
+        try {
+            onAuthorizeUrl(authorizeUrl.toString())
+        } catch (error) {
+            debug("onAuthorizeUrl callback failed:", error?.message)
+        }
         // Not awaited: some openers block until the browser window closes,
         // and the callback can land before they return.
         Promise.resolve()
@@ -1127,9 +1162,379 @@ export async function logout({ fetchImpl = globalThis.fetch, timeoutMs = LOGIN_H
     }
     clearAuth()
     // A deliberate sign-out is not a first run: the user knows /ciwg-login.
-    // Hold the daily "connect company knowledge" nudge for a day.
-    updateState({ first_run_hint_at: Date.now() })
+    // Hold the daily "connect company knowledge" nudge AND the automatic
+    // browser sign-in for a day — signing out must not re-open the browser
+    // at the next session.
+    const now = Date.now()
+    updateState({ first_run_hint_at: now, auto_login_at: now })
     return { hadSession: Boolean(auth), revoked, email: auth?.email }
+}
+
+// ------------------------------------------------------ automatic login
+
+/**
+ * "Automatic" sign-in: the plugin opens the browser sign-in BY ITSELF the
+ * first time a session (or a tool call) finds no credential, instead of
+ * asking the user to type /ciwg-login. Two entry points share this:
+ *
+ *   - the SessionStart hook, which must return within its budget: it
+ *     spawns a DETACHED `login.mjs --auto` child (spawnAutoLogin), waits up
+ *     to ~2.5 s for the child to publish the authorize URL, and tells the
+ *     user the browser is opening. The child owns the loopback listener and
+ *     finishes the flow on its own; later hooks simply find auth.json.
+ *   - the stdio MCP server, a long-lived process: it runs the flow
+ *     in-process (beginBackgroundLogin) and answers the tool call at once.
+ *
+ * Cadence: once per day per machine (state.auto_login_at — stamped the
+ * moment the authorize URL exists, i.e. just before the browser opens, so
+ * a crash after that point cannot re-open it next session, while an
+ * attempt that never reached the sign-in server may be retried at the
+ * next start); a running attempt (auto-login.json, pid-checked) is never
+ * duplicated — a process that loses the claim FOLLOWS the winner instead
+ * of opening a second tab; headless sessions, an opt-out
+ * (CIWG_AUTO_LOGIN=off / "autoLogin": false in knowledge.json), CI and
+ * anything but a real session startup (resume, compact, clear) never
+ * auto-open anything — they get the old one-line /ciwg-login hint
+ * instead. /ciwg-login stays the manual path.
+ */
+
+const AUTO_LOGIN_VERSION = 1
+/** At most one automatic browser sign-in per machine per day. */
+const AUTO_LOGIN_EVERY_MS = 24 * 60 * 60_000
+/** The loopback flow gives up after 3 minutes; a marker older than this is
+ * a crashed attempt whatever its pid says. */
+const AUTO_LOGIN_STALE_MS = 5 * 60_000
+export const AUTO_LOGIN_TIMEOUT_MS = 180_000
+/** Default wait for the child's authorize URL inside a hook. */
+const AUTO_LOGIN_URL_WAIT_MS = 2_500
+const AUTO_LOGIN_POLL_MS = 100
+/** A marker that does not parse but was written this recently is a sibling
+ * between its O_EXCL create and the end of its write (a torn read) — live,
+ * not garbage. */
+const AUTO_LOGIN_TORN_GRACE_MS = 5_000
+/** How often a process that yielded to a sibling's attempt looks for the
+ * outcome (auth.json landing, or the marker going away). */
+const AUTO_LOGIN_FOLLOW_POLL_MS = 250
+/** Longest link ever relayed from a marker (an authorize URL is ~400 chars). */
+const AUTO_LOGIN_URL_MAX_CHARS = 4_096
+
+/**
+ * Tool-triggered sign-ins from ONE long-lived MCP server process back off:
+ * the model may retry a tool many times, and a user who closed the tab
+ * must not get a new one every five minutes for the life of the process.
+ * `attempt` counts the attempts made so far (1-based): 5 → 10 → 20 → 40 →
+ * 60 min, capped at an hour. A successful sign-in resets the count.
+ */
+export const SIGN_IN_COOLDOWN_BASE_MS = 5 * 60_000
+export const SIGN_IN_COOLDOWN_CAP_MS = 60 * 60_000
+export const signInCooldownMs = (attempt) =>
+    Math.min(SIGN_IN_COOLDOWN_CAP_MS, SIGN_IN_COOLDOWN_BASE_MS * 2 ** Math.max(0, attempt - 1))
+
+const isOff = (value) => /^(off|0|false|no)$/i.test(String(value ?? "").trim())
+
+/** Env CIWG_AUTO_LOGIN=off (also 0/false/no) or `"autoLogin": false` in
+ * ~/.ciwg/knowledge.json turns the automatic browser sign-in off. */
+export function isAutoLoginOptedOut(env = process.env) {
+    if (env.CIWG_AUTO_LOGIN !== undefined && isOff(env.CIWG_AUTO_LOGIN)) return true
+    const parsed = readJson(join(ciwgDir(), "knowledge.json"))
+    return parsed?.autoLogin === false
+}
+
+/** SSH sessions, display-less Linux and CI runners cannot receive a
+ * loopback redirect in a local browser — the device flow (manual) is the
+ * path there. Shared by login.mjs and the automatic sign-in. */
+export function looksHeadless(env = process.env, platform = process.platform) {
+    if (env.SSH_CONNECTION || env.SSH_TTY) return true
+    if (env.CI && !isOff(env.CI)) return true
+    return platform === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY
+}
+
+function pidAlive(pid) {
+    if (!Number.isInteger(pid) || pid <= 0) return false
+    if (pid === process.pid) return true
+    try {
+        process.kill(pid, 0)
+        return true
+    } catch (error) {
+        return error.code !== "ESRCH"
+    }
+}
+
+/** A link safe to hand to the user: https or loopback-http, one token (no
+ * whitespace or quote characters that could smuggle a second "link" into
+ * the line it is printed on), bounded length. The marker is a 0600 file in
+ * ~/.ciwg, but what is relayed into a chat line is checked regardless. */
+const isRelayableUrl = (value) =>
+    isEndpointUrl(value) &&
+    value.length <= AUTO_LOGIN_URL_MAX_CHARS &&
+    /^[^\s"'<>]+$/.test(value)
+
+/**
+ * The running automatic sign-in ({pid, started_at, url?}) or null when
+ * there is none, it is stale, or its process is gone. A `url` that is not
+ * an https / loopback link is dropped (the marker still counts as live).
+ *
+ * PID reuse is judged conservatively: a marker whose pid now belongs to
+ * some unrelated process reads as LIVE (no second browser, the hint is
+ * withheld) until its 5-minute age limit — erring towards not opening a
+ * tab, never towards opening two.
+ */
+export function readAutoLoginMarker({ now = Date.now() } = {}) {
+    const marker = readJson(autoLoginPath())
+    if (!marker || marker.version !== AUTO_LOGIN_VERSION) return null
+    if (!Number.isFinite(marker.started_at) || now - marker.started_at > AUTO_LOGIN_STALE_MS) {
+        return null
+    }
+    if (!pidAlive(marker.pid)) return null
+    if (marker.url !== undefined && !isRelayableUrl(marker.url)) {
+        debug("auto-login marker url ignored: not an https/loopback link")
+        const { url, url_at, ...rest } = marker
+        void url
+        void url_at
+        return rest
+    }
+    return marker
+}
+
+/** The marker exists but does not parse. A sibling is between its O_EXCL
+ * create and the end of its write (or a publish is landing) when the mtime
+ * is fresh — live. Only an OLD unparsable file is garbage we may remove. */
+function markerBeingWritten(now) {
+    if (readJson(autoLoginPath()) !== null) return false
+    try {
+        return now - statSync(autoLoginPath()).mtimeMs < AUTO_LOGIN_TORN_GRACE_MS
+    } catch {
+        return false // gone between the EEXIST and the stat
+    }
+}
+
+/**
+ * Create the marker EXCLUSIVELY (O_EXCL). "owned": this process runs the
+ * attempt. "sibling": a LIVE attempt exists — a sibling's marker (pid
+ * alive, fresh), or one being written right now (torn read). "unwritable":
+ * the filesystem refused (then auth.json cannot be written either — the
+ * caller may still run the flow and let the persist step report it). A
+ * stale marker (dead pid, too old, old garbage) is replaced.
+ */
+export function tryClaimAutoLogin({ now = Date.now() } = {}) {
+    const record = { version: AUTO_LOGIN_VERSION, pid: process.pid, started_at: now }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            ensureCiwgDir()
+            writeFileSync(autoLoginPath(), `${JSON.stringify(record, null, 2)}\n`, {
+                mode: 0o600,
+                flag: "wx",
+            })
+            return "owned"
+        } catch (error) {
+            if (error.code !== "EEXIST") {
+                debug("auto-login marker unwritable:", error.code || error.message)
+                return "unwritable"
+            }
+            if (readAutoLoginMarker({ now }) || markerBeingWritten(now)) return "sibling"
+            rmQuiet(autoLoginPath())
+        }
+    }
+    // Two stale markers replaced under us: whoever re-took it is live.
+    return "sibling"
+}
+
+/** true when this process now owns the attempt (see tryClaimAutoLogin). */
+export const claimAutoLogin = (opts) => tryClaimAutoLogin(opts) === "owned"
+
+/** Publish the authorize URL on an attempt this process owns. */
+export function publishAutoLoginUrl(url, { now = Date.now() } = {}) {
+    const marker = readJson(autoLoginPath())
+    if (!marker || marker.pid !== process.pid) return
+    try {
+        writeJsonAtomic(autoLoginPath(), { ...marker, url, url_at: now }, { mode: 0o600 })
+    } catch (error) {
+        debug("auto-login url publish failed:", error.code || error.message)
+    }
+}
+
+export function releaseAutoLogin() {
+    const marker = readJson(autoLoginPath())
+    if (marker && marker.pid === process.pid) rmQuiet(autoLoginPath())
+}
+
+/**
+ * Should an automatic sign-in start now for a failed credential status?
+ *   "due"            → start one
+ *   "in-progress"    → one is running (browser already open) — say nothing new
+ *   "recent"         → one ran within the last day — fall back to the hint
+ *   "opted-out" / "headless" / "not-applicable" → never auto-open
+ */
+export function autoLoginDecision(
+    status,
+    { now = Date.now(), env = process.env, platform = process.platform } = {}
+) {
+    if (status !== "no-token" && status !== "relogin") return "not-applicable"
+    if (isAutoLoginOptedOut(env)) return "opted-out"
+    if (looksHeadless(env, platform)) return "headless"
+    if (readAutoLoginMarker({ now })) return "in-progress"
+    const at = readState().auto_login_at
+    if (Number.isFinite(at) && now - at < AUTO_LOGIN_EVERY_MS) return "recent"
+    return "due"
+}
+
+/**
+ * Stamp the daily cadence and forget the previous attempt's error. Called
+ * the moment the authorize URL exists — just BEFORE the browser is
+ * launched — so a crash after the tab opened cannot re-open one next
+ * session, while an attempt that never reached the sign-in server (no
+ * URL, no tab) leaves the cadence alone and may be retried at the next
+ * session start.
+ */
+export function markAutoLoginStarted(now = Date.now()) {
+    updateState({ auto_login_at: now, auto_login_error: null })
+}
+
+export function markAutoLoginFailed(message, now = Date.now()) {
+    updateState({ auto_login_error: String(message ?? "unknown").slice(0, 200), auto_login_error_at: now })
+}
+
+/**
+ * Run the loopback sign-in in the background of THIS process (the MCP
+ * server). Returns at once with {url, done}: `url` settles (string or null)
+ * within `urlTimeoutMs`; `done` settles with {ok, email?} / {ok:false,
+ * error} when the flow ends. Never rejects.
+ *
+ * When a LIVE sibling already owns the attempt (two sessions or two stdio
+ * servers racing on a first use), NO second listener or browser is
+ * started: the sibling's published link is relayed and `done` follows the
+ * sibling's outcome (followSiblingLogin). Only when the marker cannot be
+ * written at all does the flow run unclaimed.
+ */
+export function beginBackgroundLogin({
+    urlTimeoutMs = 2_000,
+    timeoutMs = AUTO_LOGIN_TIMEOUT_MS,
+    now = Date.now,
+    sleep = defaultSleep,
+    ...loginOpts
+} = {}) {
+    const claim = tryClaimAutoLogin({ now: now() })
+    if (claim === "sibling") return followSiblingLogin({ urlTimeoutMs, timeoutMs, now, sleep })
+    const owned = claim === "owned"
+    let resolveUrl
+    const url = new Promise((resolve) => {
+        resolveUrl = resolve
+    })
+    const urlTimer = setTimeout(() => resolveUrl(null), urlTimeoutMs)
+    urlTimer.unref?.()
+    const done = loginWithBrowser({
+        ...loginOpts,
+        timeoutMs,
+        now,
+        onAuthorizeUrl: (value) => {
+            markAutoLoginStarted(now())
+            if (owned) publishAutoLoginUrl(value, { now: now() })
+            resolveUrl(value)
+        },
+    })
+        .then((result) => ({ ok: true, ...result }))
+        .catch((error) => {
+            markAutoLoginFailed(error?.message ?? error, now())
+            return { ok: false, error: error?.message ?? String(error) }
+        })
+        .finally(() => {
+            clearTimeout(urlTimer)
+            resolveUrl(null)
+            if (owned) releaseAutoLogin()
+        })
+    return { url, done }
+}
+
+/**
+ * The losing side of a claim race: relay the winner's link and report its
+ * outcome, opening nothing. `url` waits up to urlTimeoutMs for the sibling
+ * to publish (it claims first and discovers the IdP after). `done` settles
+ * {ok:true, sibling:true, email…} when auth.json appears, {ok:false,
+ * sibling:true} when the sibling's marker is gone or stale without one,
+ * or after the flow's own lifetime — it never outlives a real attempt.
+ */
+function followSiblingLogin({ urlTimeoutMs, timeoutMs, now, sleep }) {
+    const startedAt = now()
+    const url = (async () => {
+        const deadline = startedAt + urlTimeoutMs
+        for (;;) {
+            const marker = readAutoLoginMarker({ now: now() })
+            if (!marker) return null
+            if (marker.url) return marker.url
+            if (now() >= deadline) return null
+            await sleep(AUTO_LOGIN_POLL_MS)
+        }
+    })()
+    const done = (async () => {
+        const deadline = startedAt + timeoutMs
+        for (;;) {
+            const auth = readAuth()
+            if (auth) {
+                return {
+                    ok: true,
+                    sibling: true,
+                    email: auth.email,
+                    expiresAt: auth.expires_at,
+                    hasRefreshToken: Boolean(auth.refresh_token),
+                }
+            }
+            if (!readAutoLoginMarker({ now: now() })) {
+                return {
+                    ok: false,
+                    sibling: true,
+                    error: "the sign-in opened by another session ended without signing in",
+                }
+            }
+            if (now() >= deadline) {
+                return {
+                    ok: false,
+                    sibling: true,
+                    error: "timed out waiting for the sign-in opened by another session",
+                }
+            }
+            await sleep(AUTO_LOGIN_FOLLOW_POLL_MS)
+        }
+    })()
+    return { url, done }
+}
+
+/**
+ * Hook path: start a DETACHED `login.mjs --auto` process and wait briefly
+ * for the authorize URL it publishes. Resolves {started, url}; `url` is
+ * null when the child had not reached the IdP yet (slow discovery) — the
+ * browser MAY still open from the child, which stamps the daily cadence
+ * itself the moment it has the link (nothing is stamped here: an attempt
+ * that never gets a link may be retried next session). Never throws.
+ */
+export async function spawnAutoLogin({
+    waitMs = AUTO_LOGIN_URL_WAIT_MS,
+    sleep = defaultSleep,
+    now = Date.now,
+    scriptPath = fileURLToPath(new URL("../login.mjs", import.meta.url)),
+    spawnImpl = spawn,
+} = {}) {
+    let child
+    try {
+        child = spawnImpl(process.execPath, [scriptPath, "--auto"], {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+            env: process.env,
+        })
+        child.once?.("error", (error) => debug("auto-login child failed to start:", error?.message))
+        child.unref?.()
+    } catch (error) {
+        debug("auto-login spawn failed:", error?.message)
+        markAutoLoginFailed(`could not start the sign-in helper: ${error?.message}`, now())
+        return { started: false, url: null }
+    }
+    const deadline = now() + waitMs
+    while (now() < deadline) {
+        const marker = readAutoLoginMarker({ now: now() })
+        if (marker?.url) return { started: true, url: marker.url }
+        await sleep(AUTO_LOGIN_POLL_MS)
+    }
+    return { started: true, url: null }
 }
 
 // ---------------------------------------------------------------- status
@@ -1147,6 +1552,22 @@ export function describeAuthStatus({ now = Date.now() } = {}) {
             lines.push(`SSO: sign-in required${who} — the session expired or was revoked${why}; run /ciwg-login.`)
         } else {
             lines.push("SSO: not signed in — run /ciwg-login.")
+        }
+        if (isAutoLoginOptedOut()) {
+            lines.push("Automatic sign-in: off (CIWG_AUTO_LOGIN / \"autoLogin\": false).")
+        } else if (readAutoLoginMarker({ now })) {
+            lines.push("Automatic sign-in: a browser sign-in is open right now — finish it there.")
+        } else if (state.auto_login_error) {
+            // The cadence is stamped only once a link existed: an attempt
+            // that never reached the sign-in server is retried at the next
+            // session start, one whose tab opened waits a day.
+            const retry = Number.isFinite(state.auto_login_at)
+                ? "it retries tomorrow"
+                : "it retries at the next session start"
+            lines.push(`Automatic sign-in: the last attempt failed (${state.auto_login_error}); ${retry}, or run /ciwg-login now.`)
+        } else if (Number.isFinite(state.auto_login_at)) {
+            const until = new Date(state.auto_login_at + AUTO_LOGIN_EVERY_MS).toISOString()
+            lines.push(`Automatic sign-in: held until ${until} (it ran, or you signed out, within the last day); run /ciwg-login to sign in now.`)
         }
         return lines.join("\n")
     }
