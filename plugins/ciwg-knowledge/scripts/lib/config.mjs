@@ -1,10 +1,12 @@
 /**
  * Shared config + API access for the ciwg-knowledge plugin.
  *
- * Auth: an API token with the `route:knowledge` scope (minted in synapse
- * admin → API tokens). Sources, in order: CIWG_KNOWLEDGE_TOKEN env, then
- * ~/.ciwg/knowledge.json {"token": "..."}. No token = every entry point
- * no-ops silently — the plugin must never break a session.
+ * Auth (see lib/auth.mjs): the hooks send the CIWG SSO (Authentik) access
+ * token as `Authorization: Bearer` — obtained with /ciwg-login, refreshed
+ * silently. A legacy `route:knowledge` API token (CIWG_KNOWLEDGE_TOKEN env,
+ * then ~/.ciwg/knowledge.json {"token": "..."}) still works as X-API-Token
+ * and takes precedence when set. No credential = every entry point no-ops
+ * silently — the plugin must never break a session.
  *
  * Client mapping: an optional .ciwg-client.json at the project root
  * ({"organizationId": 7, "clientName": "Acme HVAC"}) scopes retrieval to
@@ -12,13 +14,16 @@
  * values are validated, capped, and escaped before they touch context.
  *
  * Diagnostics: set CIWG_KNOWLEDGE_DEBUG=1 for stderr traces — the hot
- * paths stay silent by design, which otherwise makes "unscoped token",
+ * paths stay silent by design, which otherwise makes "sign-in expired",
  * "BOM in config", and "nothing relevant" indistinguishable.
  */
 
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
-import { homedir } from "node:os"
+import { mkdirSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { getLegacyToken, resolveAuth } from "./auth.mjs"
+import { ciwgDir, debug, readJson } from "./paths.mjs"
+
+export { debug }
 
 export const API_BASE = (
     process.env.CIWG_KNOWLEDGE_URL || "https://api.ciwebgroup.com"
@@ -26,37 +31,12 @@ export const API_BASE = (
 
 /** After a network-level failure, skip lookups for this long. */
 const BACKOFF_MS = 60_000
-const DOWN_MARKER = join(homedir(), ".ciwg", "knowledge-down")
+const downMarker = () => join(ciwgDir(), "knowledge-down")
 
-export function debug(...args) {
-    if (process.env.CIWG_KNOWLEDGE_DEBUG) {
-        console.error("[ciwg-knowledge]", ...args)
-    }
-}
-
-const stripBom = (s) => s.replace(/^﻿/, "")
-
-export function getToken() {
-    let raw = process.env.CIWG_KNOWLEDGE_TOKEN
-    if (!raw) {
-        try {
-            const parsed = JSON.parse(
-                stripBom(
-                    readFileSync(join(homedir(), ".ciwg", "knowledge.json"), "utf8")
-                )
-            )
-            raw = typeof parsed.token === "string" ? parsed.token : null
-        } catch (error) {
-            debug("token file unreadable:", error.message)
-            return null
-        }
-    }
-    if (!raw) return null
-    // A token pasted from a wrapped email/Slack message carries interior
-    // whitespace; header-illegal characters would otherwise surface the
-    // token inside a Headers error message.
-    return raw.replace(/\s+/g, "") || null
-}
+/** Legacy API token only (env, then knowledge.json). Kept for callers that
+ * need to know whether the legacy path is active; API calls go through
+ * resolveAuth(), which also covers SSO. */
+export const getToken = (env) => getLegacyToken(env)
 
 /** Escape for XML attribute/body context — repo-authored values only. */
 export function escapeXml(value) {
@@ -72,36 +52,30 @@ const MAX_INT32 = 2147483647
 /** {organizationId?, clientName?} from <cwd>/.ciwg-client.json, or null. */
 export function getClientMapping(cwd) {
     if (!cwd) return null
-    try {
-        const parsed = JSON.parse(
-            stripBom(readFileSync(join(cwd, ".ciwg-client.json"), "utf8"))
-        )
-        // Accept a quoted number too — a config typo must not silently
-        // WIDEN the search to cross-org.
-        const orgRaw =
-            typeof parsed.organizationId === "string" &&
-            /^[1-9]\d{0,9}$/.test(parsed.organizationId)
-                ? Number(parsed.organizationId)
-                : parsed.organizationId
-        const organizationId =
-            Number.isInteger(orgRaw) && orgRaw > 0 && orgRaw <= MAX_INT32
-                ? orgRaw
-                : undefined
-        const clientName =
-            typeof parsed.clientName === "string" && parsed.clientName.trim()
-                ? parsed.clientName.trim().slice(0, 80)
-                : undefined
-        if (organizationId === undefined && clientName === undefined) return null
-        return { organizationId, clientName }
-    } catch (error) {
-        debug("client mapping unreadable:", error.message)
-        return null
-    }
+    const parsed = readJson(join(cwd, ".ciwg-client.json"))
+    if (!parsed || typeof parsed !== "object") return null
+    // Accept a quoted number too — a config typo must not silently
+    // WIDEN the search to cross-org.
+    const orgRaw =
+        typeof parsed.organizationId === "string" &&
+        /^[1-9]\d{0,9}$/.test(parsed.organizationId)
+            ? Number(parsed.organizationId)
+            : parsed.organizationId
+    const organizationId =
+        Number.isInteger(orgRaw) && orgRaw > 0 && orgRaw <= MAX_INT32
+            ? orgRaw
+            : undefined
+    const clientName =
+        typeof parsed.clientName === "string" && parsed.clientName.trim()
+            ? parsed.clientName.trim().slice(0, 80)
+            : undefined
+    if (organizationId === undefined && clientName === undefined) return null
+    return { organizationId, clientName }
 }
 
 function isBackedOff() {
     try {
-        return Date.now() - statSync(DOWN_MARKER).mtimeMs < BACKOFF_MS
+        return Date.now() - statSync(downMarker()).mtimeMs < BACKOFF_MS
     } catch {
         return false
     }
@@ -109,29 +83,44 @@ function isBackedOff() {
 
 function markDown() {
     try {
-        mkdirSync(join(homedir(), ".ciwg"), { recursive: true })
-        writeFileSync(DOWN_MARKER, String(Date.now()))
+        mkdirSync(ciwgDir(), { recursive: true })
+        writeFileSync(downMarker(), String(Date.now()))
     } catch {
         /* best effort */
     }
 }
 
 /**
+ * Credential headers for one API call, or a failure status. A transient
+ * failure while refreshing the SSO token (IdP unreachable / 5xx) trips the
+ * same 60s backoff as an API network failure so hooks never hammer a
+ * struggling IdP.
+ */
+async function authHeaders() {
+    const auth = await resolveAuth()
+    if (auth.ok) return { ok: true, headers: auth.headers }
+    if (auth.status === "network" || auth.status === "http") markDown()
+    return { ok: false, status: auth.status }
+}
+
+/**
  * GET /api/v1/knowledge/search.
  * Returns {ok:true, data} or {ok:false, status} where status is an HTTP
- * status number, "network", "backoff", or "no-token" — callers decide how
- * loud to be (hooks: silent; MCP: actionable message).
+ * status number, "network", "backoff", "no-token" (never signed in, no
+ * legacy token) or "relogin" (SSO refresh rejected — sign in again) —
+ * callers decide how loud to be (hooks: silent / one hint; MCP: actionable
+ * message).
  */
 export async function searchKnowledge(
     { q, organizationId, sourceTypes, limit, minScore },
     timeoutMs = 4000
 ) {
-    const token = getToken()
-    if (!token) return { ok: false, status: "no-token" }
     if (isBackedOff()) {
         debug("skipping lookup (recent network failure)")
         return { ok: false, status: "backoff" }
     }
+    const auth = await authHeaders()
+    if (!auth.ok) return { ok: false, status: auth.status }
     const url = new URL(`${API_BASE}/api/v1/knowledge/search`)
     url.searchParams.set("q", String(q).slice(0, 500))
     if (organizationId != null) {
@@ -147,7 +136,7 @@ export async function searchKnowledge(
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
         const res = await fetch(url, {
-            headers: { "X-API-Token": token },
+            headers: auth.headers,
             signal: controller.signal,
         })
         if (!res.ok) {
@@ -156,7 +145,7 @@ export async function searchKnowledge(
         }
         return { ok: true, data: await res.json() }
     } catch (error) {
-        debug("search network failure:", error.message)
+        debug("search network failure:", error.name)
         markDown()
         return { ok: false, status: "network" }
     } finally {
@@ -173,34 +162,25 @@ export async function searchKnowledge(
 export function isEngramOptedOut() {
     const env = (process.env.CIWG_ENGRAM || "").trim().toLowerCase()
     if (env === "off" || env === "0" || env === "false") return true
-    try {
-        const parsed = JSON.parse(
-            stripBom(
-                readFileSync(join(homedir(), ".ciwg", "knowledge.json"), "utf8")
-            )
-        )
-        if (parsed.engram === false) return true
-    } catch (error) {
-        debug("knowledge config unreadable for engram opt-out:", error.message)
-    }
-    return false
+    const parsed = readJson(join(ciwgDir(), "knowledge.json"))
+    return parsed?.engram === false
 }
 
-/** Shared request core for the engram endpoints — same token / 60s-backoff /
- * mark-down discipline as searchKnowledge. */
+/** Shared request core for the engram endpoints — same credential /
+ * 60s-backoff / mark-down discipline as searchKnowledge. */
 async function engramRequest(url, init, timeoutMs) {
-    const token = getToken()
-    if (!token) return { ok: false, status: "no-token" }
     if (isBackedOff()) {
         debug("skipping engram call (recent network failure)")
         return { ok: false, status: "backoff" }
     }
+    const auth = await authHeaders()
+    if (!auth.ok) return { ok: false, status: auth.status }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
         const res = await fetch(url, {
             ...init,
-            headers: { "X-API-Token": token, ...(init.headers || {}) },
+            headers: { ...auth.headers, ...(init.headers || {}) },
             signal: controller.signal,
         })
         if (!res.ok) {
@@ -209,7 +189,7 @@ async function engramRequest(url, init, timeoutMs) {
         }
         return { ok: true, data: await res.json() }
     } catch (error) {
-        debug("engram network failure:", error.message)
+        debug("engram network failure:", error.name)
         markDown()
         return { ok: false, status: "network" }
     } finally {
@@ -299,17 +279,21 @@ export function renderEngramLines(
 /** Human-actionable line for a searchKnowledge failure status. */
 export function describeFailure(status) {
     if (status === "no-token") {
-        return "No knowledge API token configured. Set CIWG_KNOWLEDGE_TOKEN or ~/.ciwg/knowledge.json — see the ciwg-knowledge plugin README."
+        return "Not signed in to company knowledge. Run /ciwg-login (or `node scripts/login.mjs`) to sign in with CIWG SSO — see the ciwg-knowledge plugin README."
     }
-    if (status === 401) return "Knowledge API rejected the token (401)."
+    if (status === "relogin") {
+        return "The company-knowledge sign-in expired or was revoked. Run /ciwg-login to sign in again."
+    }
+    if (status === 401) return "Knowledge API rejected the credential (401)."
     if (status === 403) {
-        return "Token lacks the route:knowledge scope, or the token creator is not internal staff (403)."
+        return "Credential lacks access: the account is not internal staff, or a legacy token lacks the route:knowledge scope (403)."
     }
     if (status === 400) return "Knowledge API rejected the parameters (400)."
     if (status === "backoff") {
-        return "Knowledge API recently unreachable — backing off briefly."
+        return "Knowledge API (or the sign-in server) recently unreachable — backing off briefly."
     }
     if (status === "network") return "Knowledge API unreachable (network)."
+    if (status === "http") return "Sign-in server returned a transient error — try again shortly."
     return `Knowledge API error (${status}).`
 }
 
@@ -321,9 +305,12 @@ export async function readStdin() {
 }
 
 /** Emit hook JSON and exit ONLY after stdout drains (Windows pipes are
- * async — a bare process.exit truncates the payload intermittently). */
+ * async — a bare process.exit truncates the payload intermittently).
+ * Returns a promise that never settles so a caller can `await` it and
+ * nothing after the call runs before the exit. */
 export function emitAndExit(payload) {
     process.stdout.write(JSON.stringify(payload), () => process.exit(0))
+    return new Promise(() => {})
 }
 
 /** UTF-16 clamp with ellipsis; never leaves a dangling high surrogate (a

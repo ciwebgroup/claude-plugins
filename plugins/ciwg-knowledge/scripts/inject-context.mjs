@@ -11,11 +11,18 @@
  * spends no tokens or reasoning on retrieval — the context is simply
  * present.
  *
- * Fail-open discipline: every failure path (no token, timeout, API down,
- * malformed stdin) exits 0 with no output. Set CIWG_KNOWLEDGE_DEBUG=1 for
- * stderr traces.
+ * Sign-in: the API calls use the cached CIWG SSO token (silently refreshed).
+ * If the refresh is REJECTED — user deactivated, token revoked — the hook
+ * injects one short "run /ciwg-login" line once per session and is silent
+ * otherwise. Never signed in at all → silent here (SessionStart owns the
+ * once-a-day first-run hint).
+ *
+ * Fail-open discipline: every failure path (no credential, timeout, API
+ * down, malformed stdin) exits 0 with no output. Set CIWG_KNOWLEDGE_DEBUG=1
+ * for stderr traces.
  */
 
+import { LOGIN_HINT_RELOGIN, reloginHintDue } from "./lib/auth.mjs"
 import {
     TRUST_PREAMBLE,
     debug,
@@ -68,6 +75,19 @@ try {
             limit: 5,
         }),
     ])
+
+    if (result.status === "relogin" || engram.status === "relogin") {
+        if (reloginHintDue(payload.session_id)) {
+            await emitAndExit({
+                hookSpecificOutput: {
+                    hookEventName: "UserPromptSubmit",
+                    additionalContext: LOGIN_HINT_RELOGIN,
+                },
+            })
+        }
+        debug("sign-in required — hint already shown this session")
+        process.exit(0)
+    }
 
     const hits = result.ok
         ? (result.data?.hits?.filter((h) => h.score >= MIN_SCORE) ?? [])

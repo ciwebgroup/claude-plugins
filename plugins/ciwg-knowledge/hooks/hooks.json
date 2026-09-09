@@ -6,7 +6,7 @@
                     {
                         "type": "command",
                         "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/inject-context.mjs\"",
-                        "timeout": 6
+                        "timeout": 8
                     }
                 ]
             }
@@ -17,7 +17,7 @@
                     {
                         "type": "command",
                         "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-brief.mjs\"",
-                        "timeout": 6
+                        "timeout": 8
                     }
                 ]
             }

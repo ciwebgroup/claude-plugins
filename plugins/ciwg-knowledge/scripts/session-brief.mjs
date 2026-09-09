@@ -1,5 +1,12 @@
 /**
- * SessionStart hook — client brief + today's team activity on session open.
+ * SessionStart hook — sign-in nudge, client brief, today's team activity.
+ *
+ * Sign-in nudge (first thing, before any API call):
+ *   - never signed in (no SSO cache, no legacy token) → ONE line asking
+ *     the user to run /ciwg-login, at most once a day (marker file), then
+ *     nothing else;
+ *   - SSO refresh rejected (revoked / expired) → the same kind of line,
+ *     once per session.
  *
  * Knowledge brief: fires only in repos whose .ciwg-client.json carries BOTH
  * an organizationId and a clientName: the org id server-side-filters the
@@ -16,6 +23,13 @@
  */
 
 import {
+    LOGIN_HINT_FIRST_RUN,
+    LOGIN_HINT_RELOGIN,
+    firstRunHintDue,
+    reloginHintDue,
+    resolveAuth,
+} from "./lib/auth.mjs"
+import {
     TRUST_PREAMBLE,
     debug,
     emitAndExit,
@@ -29,11 +43,31 @@ import {
 } from "./lib/config.mjs"
 import { detectRepoName } from "./lib/engram.mjs"
 
+const hint = (additionalContext) =>
+    emitAndExit({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext },
+    })
+
 try {
     const payload = JSON.parse(await readStdin())
     if (payload.source === "compact" || payload.source === "clear") {
         process.exit(0)
     }
+
+    // Resolves the credential once (a silent refresh if needed); the API
+    // calls below re-read the cached token from disk — no second refresh.
+    const auth = await resolveAuth()
+    if (!auth.ok) {
+        if (auth.status === "no-token" && firstRunHintDue()) {
+            await hint(LOGIN_HINT_FIRST_RUN)
+        }
+        if (auth.status === "relogin" && reloginHintDue(payload.session_id)) {
+            await hint(LOGIN_HINT_RELOGIN)
+        }
+        debug("no usable credential:", auth.status)
+        process.exit(0)
+    }
+
     const mapping = getClientMapping(payload.cwd)
     const hasFullMapping = Boolean(
         mapping?.clientName && mapping.organizationId

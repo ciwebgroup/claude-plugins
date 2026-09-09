@@ -1,7 +1,14 @@
 /**
- * ciwg-knowledge MCP server — the EXPLICIT retrieval surface (the hooks are
- * the automatic one). Raw newline-delimited JSON-RPC over stdio; no SDK
- * dependency so the plugin needs no install step.
+ * ciwg-knowledge LOCAL (stdio) MCP server — the fallback explicit retrieval
+ * surface. The plugin's primary MCP entry is the remote server at
+ * https://api.ciwebgroup.com/mcp (Claude Code signs in to it natively with
+ * CIWG SSO — see plugin.json). This stdio server wraps the same REST API
+ * with the hooks' credential (SSO cache from /ciwg-login, or a legacy
+ * token) for environments where the remote server is unreachable or
+ * blocked; register it by hand as documented in the README.
+ *
+ * Raw newline-delimited JSON-RPC over stdio; no SDK dependency so the
+ * plugin needs no install step.
  *
  * Tools:
  *   search_company_knowledge  — semantic search over ingested company
@@ -11,12 +18,8 @@
  */
 
 import { createInterface } from "node:readline"
-import {
-    API_BASE,
-    describeFailure,
-    getToken,
-    searchKnowledge,
-} from "./lib/config.mjs"
+import { resolveAuth } from "./lib/auth.mjs"
+import { API_BASE, describeFailure, searchKnowledge } from "./lib/config.mjs"
 
 const TOOLS = [
     {
@@ -101,8 +104,8 @@ async function callTool(name, args) {
         return text(JSON.stringify({ mode: result.data.mode, hits }, null, 2))
     }
     if (name === "get_source_artifacts") {
-        const token = getToken()
-        if (!token) return errText(describeFailure("no-token"))
+        const auth = await resolveAuth()
+        if (!auth.ok) return errText(describeFailure(auth.status))
         const url = new URL(`${API_BASE}/api/v1/knowledge/artifacts`)
         url.searchParams.set("source_type", String(args.source_type ?? ""))
         url.searchParams.set("source_id", String(args.source_id ?? ""))
@@ -110,7 +113,7 @@ async function callTool(name, args) {
         const timer = setTimeout(() => controller.abort(), 8000)
         try {
             const res = await fetch(url, {
-                headers: { "X-API-Token": token },
+                headers: auth.headers,
                 signal: controller.signal,
             })
             if (!res.ok) return errText(describeFailure(res.status))
@@ -140,7 +143,7 @@ rl.on("line", async (line) => {
             reply(id, {
                 protocolVersion: "2024-11-05",
                 capabilities: { tools: {} },
-                serverInfo: { name: "ciwg-knowledge", version: "0.1.0" },
+                serverInfo: { name: "ciwg-knowledge", version: "0.2.0" },
             })
         } else if (method === "ping") {
             reply(id, {})

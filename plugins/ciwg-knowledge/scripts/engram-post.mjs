@@ -9,8 +9,10 @@
  * not read the transcript, and the server whitelists payload keys anyway.
  *
  * Fail-open and fast: opt-out (CIWG_ENGRAM=off, or "engram": false in
- * ~/.ciwg/knowledge.json), no token, unmapped scratch dir, network down,
- * or the 60s backoff marker → exit 0 silently, session exit unaffected.
+ * ~/.ciwg/knowledge.json), not signed in / sign-in revoked, unmapped
+ * scratch dir, network down, or the 60s backoff marker → exit 0 silently,
+ * session exit unaffected. (No login hint here — a session that is ending
+ * has no one left to read it.)
  */
 
 import {
