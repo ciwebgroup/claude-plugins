@@ -1,11 +1,11 @@
 ---
-description: Sign in to CIWG company knowledge with CIWG SSO (Authentik). Use when the user wants to connect or reconnect company knowledge, or when a ciwg-knowledge hook says to run /ciwg-login.
+description: Sign in to CIWG company knowledge with CIWG SSO (Authentik) — the manual fallback; normally the plugin opens the sign-in by itself on first use. Use when the user asks to connect or reconnect company knowledge, or when a ciwg-knowledge hook or tool says to run /ciwg-login.
 argument-hint: "[device]"
 allowed-tools: Bash(node *)
 disable-model-invocation: true
 ---
 
-Sign the user in to CIWG company knowledge. No token, password or secret is ever typed into Claude Code — the sign-in happens in the browser. One sign-in covers the hooks AND the `ciwg-knowledge` MCP tools.
+Sign the user in to CIWG company knowledge. No token, password or secret is ever typed into Claude Code — the sign-in happens in the browser. One sign-in covers the hooks AND the `ciwg-knowledge` MCP tools. (Normally this is not needed: the plugin opens the same sign-in automatically the first time a session finds none. This command is the manual path — after a sign-out, after opting out of the automatic one, or on a machine where the browser could not open.)
 
 Mode requested: `$ARGUMENTS` (empty = browser sign-in; `device` = code-based sign-in for SSH/headless sessions).
 

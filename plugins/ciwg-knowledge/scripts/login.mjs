@@ -11,6 +11,11 @@
  *   --device-start    prints the URL + code and EXITS (for runners that
  *                     cannot show output while waiting) …
  *   --device-finish   … then waits for the approval of that pending sign-in
+ *   --auto            the AUTOMATIC sign-in helper the SessionStart hook
+ *                     spawns detached (see lib/auth.mjs "automatic login"):
+ *                     silent, claims ~/.ciwg/auto-login.json, publishes the
+ *                     authorize URL there, runs the browser flow, exits.
+ *                     Never prints; never runs when opted out or headless
  *   --status          who is signed in, token validity, legacy-token presence
  *   --help
  *
@@ -19,30 +24,27 @@
  */
 
 import {
+    AUTO_LOGIN_TIMEOUT_MS,
     LEGACY_TOKEN_NOTE,
+    claimAutoLogin,
     describeAuthStatus,
     finishDeviceLogin,
     getLegacyToken,
+    isAutoLoginOptedOut,
     loginWithBrowser,
     loginWithDeviceCode,
+    looksHeadless,
+    markAutoLoginFailed,
+    publishAutoLoginUrl,
+    readAuth,
+    releaseAutoLogin,
 } from "./lib/auth.mjs"
-import { say } from "./lib/paths.mjs"
+import { debug, say } from "./lib/paths.mjs"
 
 const flags = new Set(
     process.argv.slice(2).map((arg) => arg.replace(/^-+/, "").toLowerCase())
 )
 const has = (name) => flags.has(name)
-
-/** SSH sessions and display-less Linux cannot receive a loopback redirect
- * in a local browser — use the device flow there. */
-function looksHeadless() {
-    if (process.env.SSH_CONNECTION || process.env.SSH_TTY) return true
-    return (
-        process.platform === "linux" &&
-        !process.env.DISPLAY &&
-        !process.env.WAYLAND_DISPLAY
-    )
-}
 
 function usage() {
     say("Usage: node scripts/login.mjs [--device | --device-start | --device-finish | --status]")
@@ -69,11 +71,37 @@ async function deferredDeviceStart() {
     )
 }
 
+/**
+ * The detached automatic sign-in. Guards are re-checked here (the spawning
+ * hook checked them too, but the child may start seconds later): a legacy
+ * token or an existing sign-in means nothing to do; opt-out and headless
+ * never open a browser; a live sibling attempt (marker) is not duplicated.
+ * The daily cadence is NOT re-checked — the spawner stamped it on purpose.
+ */
+async function autoLogin() {
+    if (getLegacyToken() || readAuth()) return
+    if (isAutoLoginOptedOut() || looksHeadless()) return
+    if (!claimAutoLogin()) return
+    try {
+        await loginWithBrowser({
+            timeoutMs: AUTO_LOGIN_TIMEOUT_MS,
+            log: debug,
+            onAuthorizeUrl: (url) => publishAutoLoginUrl(url),
+        })
+    } catch (error) {
+        markAutoLoginFailed(error?.message ?? error)
+    } finally {
+        releaseAutoLogin()
+    }
+}
+
 try {
     if (has("help") || has("h")) {
         usage()
     } else if (has("status")) {
         say(describeAuthStatus())
+    } else if (has("auto")) {
+        await autoLogin()
     } else {
         if (getLegacyToken()) say(LEGACY_TOKEN_NOTE)
         if (has("device-finish")) {

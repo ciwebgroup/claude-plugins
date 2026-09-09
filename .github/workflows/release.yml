@@ -1,0 +1,85 @@
+# Test, package, and publish the plugin zips as a GitHub Release.
+#
+# Every push and PR runs the tests and builds the packages (uploaded as a
+# workflow artifact for review). On main, when plugin.json carries a
+# version that has no release yet, a release tagged
+# ciwg-knowledge-v<version> is created with:
+#   ciwg-knowledge-<version>.zip          (Claude Code)
+#   ciwg-knowledge-desktop-<version>.zip  (Claude Desktop / claude.ai / Cowork)
+#   release.json, SHA256SUMS
+# The synapse "AI Tools" page serves those assets to staff through the
+# web-services proxy (GET /api/v1/knowledge/plugin-package) — the repo is
+# private, so nothing here is a public download link. Bump the version in
+# plugins/ciwg-knowledge/.claude-plugin/plugin.json to cut a release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-package:
+    name: Test & package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tests
+        run: npm test
+      - name: Package
+        run: npm run package
+      - name: Read version
+        id: version
+        run: echo "version=$(node -p "require('./plugins/ciwg-knowledge/.claude-plugin/plugin.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ciwg-knowledge-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: test-and-package
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.test-and-package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ciwg-knowledge-${{ env.VERSION }}
+          path: dist
+      - name: Create the release once per version
+        run: |
+          set -euo pipefail
+          TAG="ciwg-knowledge-v${VERSION}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists — nothing to do (bump plugin.json to cut a new one)"
+            exit 0
+          fi
+          {
+            echo "ciwg-knowledge ${VERSION}"
+            echo
+            echo "Download the package for your Claude from the synapse AI Tools page (staff sign-in) — or here:"
+            echo
+            echo "- \`ciwg-knowledge-desktop-${VERSION}.zip\` — Claude Desktop / claude.ai / Cowork: Customize → Plugins → Upload plugin, then Connect (CIWG SSO)."
+            echo "- \`ciwg-knowledge-${VERSION}.zip\` — Claude Code: unzip into ~/.claude/skills/ciwg-knowledge (auto-loads next session; the first prompt opens the CIWG sign-in once)."
+            echo
+            echo "Checksums in SHA256SUMS."
+          } > notes.md
+          gh release create "$TAG" dist/*.zip dist/release.json dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ciwg-knowledge v${VERSION}" \
+            --notes-file notes.md

@@ -1,11 +1,14 @@
 /**
- * SessionStart hook — sign-in nudge, client brief, today's team activity.
+ * SessionStart hook — automatic sign-in, client brief, today's team activity.
  *
- * Sign-in nudge (first thing, before any API call):
- *   - never signed in (no SSO cache, no legacy token) → ONE line asking
- *     the user to run /ciwg-login, at most once a day, then nothing else;
- *   - SSO refresh rejected (revoked / expired) → the same kind of line,
- *     once per session;
+ * Sign-in (first thing, before any API call):
+ *   - never signed in / sign-in dropped → the hook OPENS THE BROWSER SIGN-IN
+ *     BY ITSELF (a detached `login.mjs --auto`, see lib/auth.mjs "automatic
+ *     login"): it tells the user in one line, gives Claude one line of
+ *     context, and returns within its budget — the sign-in finishes in the
+ *     background and the next prompt's hooks find the credential. At most
+ *     once a day; never on SSH/headless/CI or when opted out — those get
+ *     the old one-line "/ciwg-login" nudge (once a day / once per session);
  *   - the API rejected the SSO token (401) → an actionable line, once per
  *     session (the server may not trust this app yet).
  *
@@ -27,7 +30,13 @@
  * Every call is bounded by the hook deadline (hooks.json timeout).
  */
 
-import { signInHint } from "./lib/auth.mjs"
+import {
+    AUTO_LOGIN_CONTEXT,
+    AUTO_LOGIN_MESSAGE,
+    autoLoginDecision,
+    signInHint,
+    spawnAutoLogin,
+} from "./lib/auth.mjs"
 import {
     TRUST_PREAMBLE,
     debug,
@@ -43,13 +52,42 @@ import {
     searchKnowledge,
 } from "./lib/config.mjs"
 import { detectRepoName } from "./lib/engram.mjs"
+import { remainingMs } from "./lib/paths.mjs"
 
 const PROACTIVE_REFRESH_MS = 5 * 60_000
+/** Kept back after the auto-login wait for the stdout flush. */
+const AUTO_LOGIN_RESERVE_MS = 800
 
-async function hint(additionalContext) {
+async function hint(additionalContext, systemMessage) {
     await emit({
+        ...(systemMessage ? { systemMessage } : {}),
         hookSpecificOutput: { hookEventName: "SessionStart", additionalContext },
     })
+    process.exit(0)
+}
+
+/**
+ * No credential: open the browser sign-in ourselves when that is due, else
+ * fall back to the one-line nudge. Exits the process either way.
+ */
+async function handleNoCredential(status, sessionId, deadline) {
+    const decision = autoLoginDecision(status)
+    debug("no usable credential:", status, "— auto-login:", decision)
+    if (decision === "due") {
+        const waitMs = Math.max(0, Math.min(2_500, remainingMs(deadline) - AUTO_LOGIN_RESERVE_MS))
+        const { started, url } = await spawnAutoLogin({ waitMs })
+        if (started) {
+            const message = url
+                ? `${AUTO_LOGIN_MESSAGE} If it did not open, visit:\n${url}`
+                : AUTO_LOGIN_MESSAGE
+            await hint(AUTO_LOGIN_CONTEXT, message)
+        }
+    } else if (decision === "in-progress") {
+        // The browser is already open from an earlier session — say nothing.
+        process.exit(0)
+    }
+    const text = signInHint(status, sessionId)
+    if (text) await hint(text)
     process.exit(0)
 }
 
@@ -64,10 +102,7 @@ try {
     // if needed); the API calls below share the memoised result.
     const auth = await resolveCredential({ deadline, refreshWithinMs: PROACTIVE_REFRESH_MS })
     if (!auth.ok) {
-        const text = signInHint(auth.status, payload.session_id)
-        if (text) await hint(text)
-        debug("no usable credential:", auth.status)
-        process.exit(0)
+        await handleNoCredential(auth.status, payload.session_id, deadline)
     }
 
     const mapping = getClientMapping(payload.cwd)
