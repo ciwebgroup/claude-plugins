@@ -221,14 +221,24 @@ and your session (and its exit) is unaffected.
 
 ## Authentik configuration (admin)
 
-One OAuth2/OpenID provider + application, slug `ciwg-knowledge`:
+**One** OAuth2/OpenID provider + application serves all three clients —
+the claude.ai/Desktop connector, Claude Code's built-in MCP OAuth, and the
+hooks' `login.mjs`. The API validates the token's `aud` against its own
+`MCP_OAUTH_CLIENT_ID`, so the plugin's client id **must be that same
+application's client id** and the issuer that application's slug. The
+plugin defaults to slug/client id `ciwg-knowledge`; if the application is
+named differently, either rename it or set `CIWG_OIDC_ISSUER` /
+`CIWG_OIDC_CLIENT_ID` for the hooks and edit the `oauth` block in
+`plugin.json` for the MCP server (both are pinned there on purpose).
+
+Settings, assuming slug `ciwg-knowledge`:
 
 | Setting | Value | Why |
 |---|---|---|
 | Client type | **Public** | Both clients (Claude Code's built-in OAuth and `login.mjs`) run on laptops — no secret can be kept; PKCE protects the code |
 | Client ID | `ciwg-knowledge` | Pinned in `plugin.json` and `auth.mjs` (`CIWG_OIDC_CLIENT_ID` overrides for the hooks) |
-| Redirect URIs | **regex** `http://localhost:\d+/callback` **and** regex `http://127\.0\.0\.1:\d+/callback` | Claude Code's native OAuth redirects to `http://localhost:PORT/callback` on a random port; `login.mjs` binds `127.0.0.1` and redirects there (RFC 8252 loopback). Authentik strict matching cannot express a random port |
-| Scopes / property mappings | `openid`, `profile`, `email`, **`offline_access`**, `groups` (a mapping exposing the user's groups as a `groups` claim) | `offline_access` is what makes Authentik issue a refresh token (2024.2+); `groups` lets the API apply the staff gate |
+| Redirect URIs | strict `https://claude.ai/api/mcp/auth_callback` (the web/Desktop connector) **plus** **regex** `http://localhost:\d+/callback` **and** regex `http://127\.0\.0\.1:\d+/callback` | Claude Code's native OAuth redirects to `http://localhost:PORT/callback` on a random port; `login.mjs` binds `127.0.0.1` and redirects there (RFC 8252 loopback). Authentik strict matching cannot express a random port |
+| Scopes / property mappings | `openid`, `profile`, `email`, **`offline_access`** (Authentik's default `profile` mapping already emits the `groups` claim; a dedicated `groups` mapping is optional — Authentik ignores a requested scope that has no mapping) | `offline_access` is what makes Authentik issue a refresh token (2024.2+); `groups` lets the API apply the staff gate |
 | Access token validity | `minutes=10` … `minutes=15` | This bounds how long a deactivated user keeps access (default is `hours=1` — too long) |
 | Refresh token validity | e.g. `days=30` | Long-lived; the user re-logs in when it lapses. Deactivation deletes it immediately |
 | Signing key | set (RS256) | Access tokens must be JWTs the API can verify offline (`CIWG_OIDC_ISSUER` on the server) |
