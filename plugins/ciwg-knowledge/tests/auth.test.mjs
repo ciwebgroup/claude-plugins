@@ -41,10 +41,13 @@ const savedEnv = {
     USERPROFILE: process.env.USERPROFILE,
     CIWG_KNOWLEDGE_TOKEN: process.env.CIWG_KNOWLEDGE_TOKEN,
     CIWG_KNOWLEDGE_URL: process.env.CIWG_KNOWLEDGE_URL,
+    CIWG_OIDC_CLIENT_ID: process.env.CIWG_OIDC_CLIENT_ID,
 }
 process.env.HOME = fakeHome
 process.env.USERPROFILE = fakeHome
 delete process.env.CIWG_KNOWLEDGE_TOKEN
+// The default-client-id assertion below must not see a shell override.
+delete process.env.CIWG_OIDC_CLIENT_ID
 // Belt and braces: even a bug that reached the API would hit a dead port.
 process.env.CIWG_KNOWLEDGE_URL = "http://127.0.0.1:9"
 
@@ -188,6 +191,20 @@ test("decodeJwtPayload: tolerant, never throws", () => {
     assert.equal(decodeJwtPayload("not-a-jwt"), null)
     assert.equal(decodeJwtPayload(`a.${b64url("[1]")}.c`), null)
     assert.equal(decodeJwtPayload(undefined), null)
+})
+
+// ------------------------------------------------------------- client id
+
+test("OIDC_CLIENT_ID: defaults to the Authentik-generated client id (not the slug); CIWG_OIDC_CLIENT_ID overrides", async () => {
+    assert.equal(OIDC_CLIENT_ID, "lVCIMgCq4SQiQAdqHUfg7UONaOISMbpHygQXcIe1")
+    process.env.CIWG_OIDC_CLIENT_ID = "  staging-client-id  "
+    try {
+        // The query string busts the ESM cache so the constant is re-read.
+        const fresh = await import("../scripts/lib/auth.mjs?client-id-override")
+        assert.equal(fresh.OIDC_CLIENT_ID, "staging-client-id")
+    } finally {
+        delete process.env.CIWG_OIDC_CLIENT_ID
+    }
 })
 
 // ------------------------------------------------------------- discovery
