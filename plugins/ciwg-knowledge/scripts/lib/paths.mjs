@@ -90,14 +90,39 @@ export function escapeXml(value) {
         .replace(/"/g, "&quot;")
 }
 
-/** fetch with a hard timeout (AbortController). Rejects with the abort
- * error when the budget runs out; the caller maps that to a transient
- * failure. Every network call in the plugin goes through here. */
+const abortError = (signal) =>
+    signal.reason ?? new DOMException("This operation was aborted", "AbortError")
+
+/** The whole body, or the abort error the moment the signal fires — even
+ * when the fetch implementation's body stream ignores the signal. */
+function readBody(res, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) {
+            reject(abortError(signal))
+            return
+        }
+        signal.addEventListener("abort", () => reject(abortError(signal)), { once: true })
+        res.text().then(resolve, reject)
+    })
+}
+
+/**
+ * fetch with a hard timeout (AbortController) that spans the WHOLE
+ * exchange — headers AND body. A server that answers 200 and then stalls
+ * the body must not hang a hook (or a refresh that is holding auth.lock),
+ * so the body is read here, under the same timer. Resolves {ok, status,
+ * text, json()} — json() parses on demand and throws on a non-JSON body.
+ * Rejects with the abort error when the budget runs out; the caller maps
+ * that to a transient failure. Every network call in the plugin goes
+ * through here.
+ */
 export async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), Math.max(0, timeoutMs))
     try {
-        return await fetchImpl(url, { ...init, signal: controller.signal })
+        const res = await fetchImpl(url, { ...init, signal: controller.signal })
+        const text = await readBody(res, controller.signal)
+        return { ok: res.ok, status: res.status, text, json: () => JSON.parse(text) }
     } finally {
         clearTimeout(timer)
     }

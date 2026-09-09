@@ -80,7 +80,7 @@ try {
                 repo:
                     mapping?.organizationId != null
                         ? null
-                        : detectRepoName(payload.cwd),
+                        : detectRepoName(payload.cwd, { deadline }),
                 limit: 5,
             },
             { deadline }

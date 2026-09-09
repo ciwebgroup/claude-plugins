@@ -154,7 +154,7 @@ async function apiRequest(
             return { ok: false, status: res.status }
         }
         if (auth.kind === "oidc") clearApiRejected()
-        return { ok: true, data: await res.json() }
+        return { ok: true, data: res.json() }
     } catch (error) {
         // Never surface error.message — a header-illegal token value would
         // be echoed back by Node's Headers error.

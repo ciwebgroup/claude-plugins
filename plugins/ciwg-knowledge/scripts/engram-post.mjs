@@ -29,14 +29,20 @@ try {
         debug("engram opt-out active — not posting")
         process.exit(0)
     }
+    // Captured BEFORE any work: the hook timer started when this process was
+    // spawned, and the git calls below draw on the same budget as the POST
+    // that follows (up to four of them at 1.5 s each would otherwise run
+    // before the deadline was even set).
+    const deadline = hookDeadline()
     const payload = JSON.parse(await readStdin())
     const digest = buildEngramDigest({
         cwd: payload.cwd,
         transcriptPath: payload.transcript_path,
+        deadline,
     })
     if (!digest) process.exit(0)
 
-    const result = await postEngramActivity(digest, { deadline: hookDeadline() })
+    const result = await postEngramActivity(digest, { deadline })
     if (!result.ok) debug("engram post failed:", result.status)
     process.exit(0)
 } catch (error) {

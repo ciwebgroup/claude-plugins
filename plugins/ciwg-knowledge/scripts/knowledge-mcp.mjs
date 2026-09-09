@@ -21,8 +21,20 @@
 import { createInterface } from "node:readline"
 import { describeFailure, getSourceArtifacts, searchKnowledge } from "./lib/config.mjs"
 
-/** A human is waiting on a tool call, not a hook timer. */
+/**
+ * A human is waiting on a tool call, not a hook timer: the API call itself
+ * may take up to 8 s, and the WHOLE exchange — lock wait, a silent refresh,
+ * persisting a rotated token, the API call — is bounded by a 12 s deadline
+ * (without one the worst case is lock 5 s + refresh 4 s + persist 0.65 s +
+ * API 8 s ≈ 17.7 s). 12 s rather than 10 s so the common refresh-then-call
+ * case still gives the API its full 8 s.
+ */
 const TOOL_TIMEOUT_MS = 8_000
+const TOOL_DEADLINE_MS = 12_000
+const toolOpts = () => ({
+    timeoutMs: TOOL_TIMEOUT_MS,
+    deadline: Date.now() + TOOL_DEADLINE_MS,
+})
 
 const TOOLS = [
     {
@@ -93,7 +105,7 @@ async function callTool(name, args) {
                         : undefined,
                 limit: clampInt(args.limit, 1, 20),
             },
-            { timeoutMs: TOOL_TIMEOUT_MS }
+            toolOpts()
         )
         if (!result.ok) return errText(describeFailure(result.status))
         const hits = (result.data.hits ?? []).map((h) => ({
@@ -109,7 +121,7 @@ async function callTool(name, args) {
     if (name === "get_source_artifacts") {
         const result = await getSourceArtifacts(
             { sourceType: args.source_type, sourceId: args.source_id },
-            { timeoutMs: TOOL_TIMEOUT_MS }
+            toolOpts()
         )
         if (!result.ok) return errText(describeFailure(result.status))
         return text(JSON.stringify(result.data, null, 2))

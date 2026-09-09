@@ -35,7 +35,7 @@
 
 import { spawn } from "node:child_process"
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { join } from "node:path"
 import {
@@ -59,13 +59,15 @@ import {
 
 const normalizeIssuer = (s) => String(s).trim().replace(/\/*$/, "/")
 
-/** One Authentik application serves everything (claude.ai connector, the
+/** One Authentik application on the CIWG SSO instance
+ * (https://sso.ciwgserver.com) serves everything (claude.ai connector, the
  * plugin's login, the optional native Claude Code OAuth): its slug is the
  * issuer path and its client id is `ciwg-knowledge`. Env-overridable for
- * staging/local IdPs. */
+ * staging/local IdPs — and for the day the slug differs from this default
+ * (the README says how to read the exact issuer off the provider page). */
 const OIDC_ISSUER = normalizeIssuer(
     process.env.CIWG_OIDC_ISSUER ||
-        "https://auth.ciwebgroup.com/application/o/ciwg-knowledge/"
+        "https://sso.ciwgserver.com/application/o/ciwg-knowledge/"
 )
 export const OIDC_CLIENT_ID = (
     process.env.CIWG_OIDC_CLIENT_ID || "ciwg-knowledge"
@@ -174,14 +176,36 @@ export function decodeJwtPayload(jwt) {
 
 // --------------------------------------------------------------- storage
 
-/** Cached sign-in, or null when absent/unreadable/other version. Fields:
- * client_id, token_endpoint, revocation_endpoint, access_token, expires_at,
- * refresh_token, email — nothing else. "Not signed in" is the ABSENCE of
- * this file; why it is absent (never / revoked) lives in state.json. */
+/** Optional fields of a valid record — each a string when present. */
+const AUTH_STRING_FIELDS = [
+    "client_id",
+    "token_endpoint",
+    "revocation_endpoint",
+    "refresh_token",
+    "email",
+]
+
+/** Cached sign-in, or null when absent/unreadable/other version/malformed.
+ * Fields: client_id, token_endpoint, revocation_endpoint, access_token,
+ * expires_at, refresh_token, email — nothing else. A file whose fields
+ * have the wrong type (hand-edited, a torn write that still parsed) reads
+ * as "not signed in" rather than reaching the token endpoint with
+ * "[object Object]" as the refresh token. "Not signed in" is the ABSENCE
+ * of this file; why it is absent (never / revoked) lives in state.json. */
 export function readAuth() {
     const parsed = readJson(authPath())
-    if (!parsed || typeof parsed !== "object") return null
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
     if (parsed.version !== AUTH_VERSION) return null
+    if (typeof parsed.access_token !== "string" || !parsed.access_token) {
+        debug("auth.json ignored: access_token is not a string")
+        return null
+    }
+    for (const key of AUTH_STRING_FIELDS) {
+        if (parsed[key] != null && typeof parsed[key] !== "string") {
+            debug(`auth.json ignored: ${key} is not a string`)
+            return null
+        }
+    }
     return parsed
 }
 
@@ -223,11 +247,17 @@ export async function persistAuth(auth, { sleep = defaultSleep, write = writeAut
     }
 }
 
+/** Marker files the previous plugin version kept beside auth.json;
+ * state.json replaced them. Removed on sign-out so an upgrade leaves no
+ * stale "knowledge is down" / hint markers behind. */
+const LEGACY_MARKER_FILES = ["knowledge-down", "login-hint", "relogin-hint"]
+
 /** Forget the sign-in and every bit of state that describes it. */
 function clearAuth() {
     rmQuiet(authPath())
     rmQuiet(pendingPath())
     clearState()
+    for (const name of LEGACY_MARKER_FILES) rmQuiet(join(ciwgDir(), name))
 }
 
 function isFresh(auth, now = Date.now()) {
@@ -326,7 +356,12 @@ export async function discover(
     if (!res.ok) {
         throw new Error(`OIDC discovery failed (HTTP ${res.status}) at ${url}`)
     }
-    const meta = await res.json()
+    let meta
+    try {
+        meta = res.json()
+    } catch {
+        throw new Error(`OIDC discovery document at ${url} is not JSON`)
+    }
     for (const key of ["authorization_endpoint", "token_endpoint"]) {
         if (!isEndpointUrl(meta?.[key])) {
             throw new Error(`OIDC discovery document lacks ${key}`)
@@ -363,7 +398,7 @@ async function postForm(fetchImpl, url, params, timeoutMs) {
     )
     let body = {}
     try {
-        body = await res.json()
+        body = res.json()
     } catch {
         /* non-JSON error body */
     }
@@ -449,6 +484,7 @@ function lockIsStale() {
  */
 async function acquireLock(sleep, waitMs) {
     const deadline = Date.now() + waitMs
+    let stuckReported = false
     for (;;) {
         try {
             mkdirSync(lockPath(), { recursive: false })
@@ -463,7 +499,17 @@ async function acquireLock(sleep, waitMs) {
         }
         if (lockIsStale()) {
             rmQuiet(lockPath(), { recursive: true })
-            continue
+            // Gone → retry the mkdir at once. Still there (Windows EBUSY —
+            // Defender or the indexer holding auth.lock/pid — an ACL, a
+            // sibling that re-took it in between) → no free pass: fall
+            // through to the deadline check and the poll sleep like any
+            // live lock. A bare `continue` here spins SYNCHRONOUSLY for as
+            // long as the directory resists, ignoring the budget.
+            if (!existsSync(lockPath())) continue
+            if (!stuckReported) {
+                stuckReported = true
+                debug("stale auth.lock could not be removed — waiting as if live")
+            }
         }
         if (Date.now() >= deadline) return "busy"
         await sleep(LOCK_POLL_MS)
@@ -1089,15 +1135,25 @@ export function describeAuthStatus({ now = Date.now() } = {}) {
         return lines.join("\n")
     }
     const minutes = Math.round(((auth.expires_at ?? 0) - now) / 60_000)
-    const rejected =
-        state.api_rejected_at && state.api_rejected_token_exp === auth.expires_at
-    const validity = rejected
-        ? `but the knowledge API REJECTED this token (HTTP 401 at ${new Date(state.api_rejected_at).toISOString()}) — re-run /ciwg-login; if it persists the server may not trust this app yet`
+    const rejectedAt = state.api_rejected_at
+        ? new Date(state.api_rejected_at).toISOString()
+        : null
+    const rejectedThisToken =
+        rejectedAt !== null && state.api_rejected_token_exp === auth.expires_at
+    const validity = rejectedThisToken
+        ? `but the knowledge API REJECTED this token (HTTP 401 at ${rejectedAt}) — re-run /ciwg-login; if it persists the server may not trust this app yet`
         : minutes > 0
           ? `access token valid for ~${minutes} min`
           : "access token expired — refreshes on next use"
     lines.push(
         `SSO: signed in as ${auth.email ?? "(unknown user)"} — ${validity}; refresh token ${auth.refresh_token ? "cached" : "MISSING"}.`
     )
+    // A refreshed token is not "accepted" just because it is new: the
+    // rejection stays on record until the API answers 2xx to some token.
+    if (rejectedAt !== null && !rejectedThisToken) {
+        lines.push(
+            `Note: the knowledge API rejected an earlier sign-in token (HTTP 401 at ${rejectedAt}); the current one has not been accepted yet — if the hooks stay silent, re-run /ciwg-login or ask the CIWG admin.`
+        )
+    }
     return lines.join("\n")
 }

@@ -15,9 +15,10 @@
  */
 
 import assert from "node:assert/strict"
-import { execFile, execFileSync, spawnSync } from "node:child_process"
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
+    chmodSync,
     existsSync,
     mkdirSync,
     mkdtempSync,
@@ -524,6 +525,78 @@ test("getAccessToken: a live lock that is never released → busy (no refresh, t
     rmSync(lock, { recursive: true, force: true })
 })
 
+test("getAccessToken: a STALE lock the filesystem refuses to remove is waited out inside the deadline, yielding to the event loop (no synchronous spin)", async (t) => {
+    // The regression: stale + undeletable → `continue` past the deadline
+    // check and the sleep → an unbounded synchronous spin. Windows: a
+    // directory that is some process's cwd cannot be removed (EBUSY) — the
+    // same shape as Defender / the indexer holding auth.lock/pid. POSIX: a
+    // parent without write permission refuses the rmdir (EACCES).
+    seedAuth()
+    const lock = join(ciwgDir, "auth.lock")
+    mkdirSync(lock)
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(lock, old, old) // no pid file + stale mtime → lockIsStale() stays true
+    let holder = null
+    if (process.platform === "win32") {
+        // The cwd handle is opened by the CHILD as it initialises, not by
+        // CreateProcess — wait for its first output, which proves it runs.
+        holder = spawn(
+            process.execPath,
+            ["-e", "process.stdout.write('held'); setTimeout(() => {}, 15000)"],
+            { cwd: lock, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }
+        )
+        await new Promise((resolve, reject) => {
+            holder.stdout.once("data", resolve)
+            holder.once("error", reject)
+            holder.once("exit", () => reject(new Error("lock holder exited before it was used")))
+        })
+    } else {
+        chmodSync(ciwgDir, 0o500)
+    }
+    try {
+        // Precondition: the lock really is undeletable here (root, or an
+        // exotic filesystem, may still remove it — then this machine has
+        // nothing to test).
+        let refused = false
+        try {
+            rmSync(lock, { recursive: true, force: true })
+        } catch {
+            refused = true
+        }
+        if (!refused || !existsSync(lock)) {
+            t.skip("could not make auth.lock undeletable on this platform")
+            return
+        }
+        assert.ok(Date.now() - statSync(lock).mtimeMs > 30_000, "the refused rm left the mtime alone")
+
+        const fetchImpl = mockFetch({
+            [META.token_endpoint]: () => json({ access_token: "must-not-happen", expires_in: 300 }),
+        })
+        let ticks = 0
+        const ticker = setInterval(() => {
+            ticks += 1
+        }, 10)
+        const t0 = Date.now()
+        // lockWaitBudget = 3000 - API_RESERVE - MIN_HTTP = 750ms.
+        const result = await getAccessToken({ fetchImpl, deadline: Date.now() + 3_000 })
+        const elapsed = Date.now() - t0
+        clearInterval(ticker)
+        assert.deepEqual(result, { token: null, reason: "busy" })
+        assert.ok(elapsed >= 600 && elapsed < 2_000, `waited ${elapsed}ms (budget 750ms)`)
+        assert.ok(ticks >= 5, `event loop ticked ${ticks} times — the wait must be asynchronous`)
+        assert.equal(fetchImpl.calls.length, 0, "never refreshed past a lock it could not take")
+        assert.equal(readAuth().refresh_token, "refresh-1", "tokens kept")
+    } finally {
+        if (holder) {
+            holder.kill()
+            await new Promise((resolve) => holder.once("exit", resolve))
+        } else {
+            chmodSync(ciwgDir, 0o700)
+        }
+        rmSync(lock, { recursive: true, force: true })
+    }
+})
+
 test("persistAuth: a rotated refresh token is written with retries and never dies with an exception", async () => {
     // Transient write failures: retried with backoff, then succeeds.
     let attempts = 0
@@ -609,6 +682,37 @@ test("budget: a hung API is cut at the remaining deadline; a spent deadline skip
     assert.equal(fetchImpl.calls.length, 1, "no call started with 50ms left")
 })
 
+test("budget: a 200 whose BODY stalls is cut by the same timer as the headers — refresh (under the lock) and API alike", async () => {
+    // A Response whose body never ends and never looks at the abort signal:
+    // the timer must win however the fetch implementation's body behaves.
+    const stalledBody = () =>
+        new Response(new ReadableStream({ start() {} }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+        })
+
+    seedAuth()
+    const idp = mockFetch({ [META.token_endpoint]: stalledBody })
+    const t0 = Date.now()
+    // httpBudget = 2500 - API_RESERVE = 1000ms for the whole refresh exchange.
+    const refreshed = await getAccessToken({ fetchImpl: idp, deadline: Date.now() + 2_500 })
+    const elapsed = Date.now() - t0
+    assert.deepEqual(refreshed, { token: null, reason: "network" })
+    assert.ok(elapsed >= 800 && elapsed < 1_800, `refresh cut at ${elapsed}ms`)
+    assert.ok(!existsSync(join(ciwgDir, "auth.lock")), "lock released after the cut")
+    assert.equal(readAuth().refresh_token, "refresh-1", "tokens kept")
+
+    rmSync(statePath, { force: true })
+    seedFresh()
+    resetCredentialMemo()
+    const api = mockFetch({ [SEARCH_URL]: stalledBody })
+    const t1 = Date.now()
+    const result = await searchKnowledge({ q: "acme" }, { deadline: Date.now() + 1_000, fetchImpl: api })
+    const elapsedApi = Date.now() - t1
+    assert.equal(result.status, "network")
+    assert.ok(elapsedApi >= 800 && elapsedApi < 1_600, `api cut at ${elapsedApi}ms`)
+})
+
 test("budget: a refresh with too little time left is skipped (tokens kept) rather than started", async () => {
     seedAuth()
     const fetchImpl = mockFetch({ [META.token_endpoint]: hang })
@@ -685,10 +789,19 @@ test("API 401 with an SSO token → actionable api-rejected status, visible in -
     // Both MCP tools go through the same helper.
     assert.deepEqual(await getSourceArtifacts({ sourceType: "a", sourceId: "b" }, { fetchImpl }), { ok: false, status: "api-rejected" })
 
+    // A refreshed token is not "accepted" just because it is new: --status
+    // keeps the earlier rejection on record until the API answers 2xx.
+    seedFresh({ expires_at: Date.now() + 20 * 60_000 })
+    const afterRefresh = describeAuthStatus()
+    assert.match(afterRefresh, /access token valid/)
+    assert.match(afterRefresh, /rejected an earlier sign-in token \(HTTP 401 at /)
+    resetCredentialMemo()
+
     status = 200
     assert.equal((await searchKnowledge({ q: "x" }, { fetchImpl })).ok, true)
     assert.equal(readState().api_rejected_at, undefined, "cleared once the API accepts the token")
     assert.match(describeAuthStatus(), /access token valid/)
+    assert.doesNotMatch(describeAuthStatus(), /earlier sign-in token/)
 
     // A legacy token's 401 is the plain numeric status.
     process.env.CIWG_KNOWLEDGE_TOKEN = "legacy"
@@ -892,7 +1005,7 @@ test("loginWithBrowser: times out and closes the listener; error callback reject
 
 test("browserLaunchSpec: Windows never goes through cmd.exe; the URL is one argv element, byte for byte", () => {
     const url =
-        "https://auth.ciwebgroup.com/application/o/authorize/?redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Fcallback&scope=openid%20profile&state=a%26b%3Dc"
+        "https://sso.ciwgserver.com/application/o/authorize/?redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Fcallback&scope=openid%20profile&state=a%26b%3Dc"
     const win = browserLaunchSpec(url, "win32")
     assert.notEqual(win.command.toLowerCase(), "cmd.exe")
     assert.notEqual(win.command.toLowerCase(), "cmd")
@@ -1110,6 +1223,40 @@ test("logout: revokes the refresh token, wipes the cache and state, holds the fi
     const wiped = await logout({ fetchImpl: down })
     assert.equal(wiped.revoked, false)
     assert.equal(readAuth(), null)
+})
+
+test("logout: also removes the previous plugin version's marker files (knowledge-down, login-hint, relogin-hint)", async () => {
+    const markers = ["knowledge-down", "login-hint", "relogin-hint"]
+    seedFresh()
+    for (const name of markers) writeFileSync(join(ciwgDir, name), String(Date.now()))
+    await logout({
+        fetchImpl: mockFetch({ [META.revocation_endpoint]: () => new Response("", { status: 200 }) }),
+    })
+    for (const name of markers) assert.ok(!existsSync(join(ciwgDir, name)), `${name} removed`)
+    assert.equal(readAuth(), null)
+})
+
+test('readAuth: a malformed auth.json (refresh_token not a string) reads as not signed in — no refresh is dialled with "[object Object]"', async () => {
+    seedAuth()
+    const raw = JSON.parse(readFileSync(authPath(), "utf8"))
+    writeFileSync(authPath(), JSON.stringify({ ...raw, refresh_token: { token: "refresh-1" } }))
+    assert.equal(readAuth(), null)
+    const fetchImpl = mockFetch({
+        [META.token_endpoint]: () => json({ access_token: "must-not-happen", expires_in: 300 }),
+    })
+    assert.deepEqual(await getAccessToken({ fetchImpl }), { token: null, reason: "none" })
+    assert.equal(fetchImpl.calls.length, 0, "nothing dialled")
+    assert.deepEqual(await resolveAuth({ fetchImpl }), { ok: false, status: "no-token" })
+
+    // Any wrong-typed field is malformed; an ABSENT optional field is fine.
+    for (const patch of [{ token_endpoint: 42 }, { access_token: null }, { email: ["x"] }]) {
+        writeFileSync(authPath(), JSON.stringify({ ...raw, ...patch }))
+        assert.equal(readAuth(), null, JSON.stringify(patch))
+    }
+    const { email, ...withoutEmail } = raw
+    writeFileSync(authPath(), JSON.stringify(withoutEmail))
+    assert.equal(readAuth()?.refresh_token, "refresh-1")
+    void email
 })
 
 // ---------------------------------------------------------------- hints

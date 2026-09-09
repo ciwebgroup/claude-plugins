@@ -101,6 +101,20 @@ test("collectGitFacts: branch, status counts, top paths, shortstat", () => {
     assert.ok(facts.insertions >= 2, `insertions: ${facts.insertions}`)
 })
 
+test("git facts are bounded by the hook deadline: a spent budget skips the git calls instead of starting them", () => {
+    // Plenty of time: the usual facts.
+    assert.equal(detectRepoName(repoDir, { deadline: Date.now() + 10_000 }), "acme-hvac")
+    assert.equal(collectGitFacts(repoDir, { deadline: Date.now() + 10_000 }).branch, "checkout-fix")
+    // Not enough left for a git call AND the POST that follows: nothing is
+    // spawned, so the digest has no repo anchor and the hook exits quietly.
+    const spent = Date.now() + 1_000
+    const t0 = Date.now()
+    assert.equal(detectRepoName(repoDir, { deadline: spent }), null)
+    assert.deepEqual(collectGitFacts(repoDir, { deadline: spent }), {})
+    assert.equal(buildEngramDigest({ cwd: repoDir, deadline: spent }), null)
+    assert.ok(Date.now() - t0 < 200, "skipped calls cost nothing")
+})
+
 test("buildEngramDigest: structured facts only, from git + mapping", () => {
     writeFileSync(
         join(repoDir, ".ciwg-client.json"),

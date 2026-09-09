@@ -75,7 +75,7 @@ try {
         mapping?.clientName && mapping.organizationId
     )
     const repoName =
-        mapping?.organizationId != null ? null : detectRepoName(payload.cwd)
+        mapping?.organizationId != null ? null : detectRepoName(payload.cwd, { deadline })
 
     const [knowledge, engram] = await Promise.all([
         hasFullMapping

@@ -130,9 +130,17 @@ immediately (Authentik's `user_deactivated` signal); their remaining
 access token lives at most its configured validity (10–15 min, see below),
 so access is cut within minutes with no plugin involvement.
 
-Overrides for staging/local IdPs: `CIWG_OIDC_ISSUER` (default
-`https://auth.ciwebgroup.com/application/o/ciwg-knowledge/`) and
-`CIWG_OIDC_CLIENT_ID` (default `ciwg-knowledge`).
+**Issuer.** The default is
+`https://sso.ciwgserver.com/application/o/ciwg-knowledge/` — the CIWG
+Authentik instance, application slug `ciwg-knowledge`. The exact string is
+whatever the provider's page in Authentik shows as *OpenID Configuration
+Issuer*; `/ciwg-login` fetches
+`<issuer>.well-known/openid-configuration` anonymously, so that URL must
+answer 200 (at the time of writing it answers 404 to an anonymous probe:
+the application is not created yet, or lives under another slug). If the
+confirmed issuer differs from the default, set `CIWG_OIDC_ISSUER` — the
+same override serves staging/local IdPs — and `CIWG_OIDC_CLIENT_ID`
+(default `ciwg-knowledge`) when the client id differs.
 
 ## Remote connector (claude.ai, Claude Desktop — optional in Claude Code)
 
@@ -260,13 +268,15 @@ and your session (and its exit) is unaffected.
 
 ## Authentik configuration (admin)
 
-**One** OAuth2/OpenID provider + application, slug and client id
+**One** OAuth2/OpenID provider + application on the CIWG Authentik
+instance (`https://sso.ciwgserver.com`), slug and client id
 `ciwg-knowledge`, serves everything: the claude.ai / Claude Desktop
 connector, this plugin's `login.mjs`, and (optionally) Claude Code's
 built-in MCP OAuth. The API validates the token's issuer and audience
 against that application, so the plugin's defaults **must** match it; if
 the application is named differently, set `CIWG_OIDC_ISSUER` /
-`CIWG_OIDC_CLIENT_ID` for the plugin.
+`CIWG_OIDC_CLIENT_ID` for the plugin (see "Issuer" above — confirm the
+string on the provider page).
 
 Settings, assuming slug `ciwg-knowledge`:
 
@@ -283,7 +293,7 @@ Settings, assuming slug `ciwg-knowledge`:
 | Users | staff group only, via the application's policy bindings | Removal from the group / deactivation = access ends within one access-token lifetime |
 
 Server side (ci-connect): the API must accept this application's tokens
-(issuer `https://auth.ciwebgroup.com/application/o/ciwg-knowledge/`,
+(issuer `https://sso.ciwgserver.com/application/o/ciwg-knowledge/`,
 audience `ciwg-knowledge`) on `/api/v1/knowledge/*`, `/api/v1/engram/*`
 **and** `/mcp` — see the dependency note at the top.
 
@@ -293,14 +303,18 @@ audience `ciwg-knowledge`) on `/api/v1/knowledge/*`, `/api/v1/engram/*`
 (pass the files — the directory form is not supported by every Node).
 
 - `engram.test.mjs` — digest construction against a throwaway git repo,
-  the opt-out switches, the no-credential fail-open, injection rendering.
+  the git calls bounded by the hook deadline, the opt-out switches, the
+  no-credential fail-open, injection rendering.
 - `auth.test.mjs` — PKCE, discovery, the token cache and silent refresh
   against a mocked token endpoint (rotation, expiry skew, `invalid_grant`
   → relogin as the ONE dropped state, every other 4xx transient, in-process
-  dedupe, the pid-aware cross-process lock, busy siblings, retried
-  persistence of a rotated token, proactive refresh), the hook time budget
-  (hung IdP / hung API cut inside the deadline, `hooks.json` timeouts vs.
-  the budget, a real hook process against a hanging API), legacy-token
+  dedupe, the pid-aware cross-process lock, busy siblings, a stale lock
+  the filesystem refuses to remove waited out inside the deadline without
+  a synchronous spin, retried persistence of a rotated token, proactive
+  refresh, a malformed `auth.json` read as not-signed-in), the hook time
+  budget (hung IdP / hung API / a 200 whose body stalls, all cut inside the
+  deadline, `hooks.json` timeouts vs. the budget, a real hook process
+  against a hanging API), legacy-token
   precedence, credential-before-backoff ordering, API 401 → actionable
   status, the loopback flow end to end (a real `127.0.0.1` listener with
   state probing, single-shot, timeout, error callback, blocking opener),
