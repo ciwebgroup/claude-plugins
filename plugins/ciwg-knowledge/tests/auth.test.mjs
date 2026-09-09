@@ -29,7 +29,7 @@ import {
     writeFileSync,
 } from "node:fs"
 import { createServer, get as httpGet } from "node:http"
-import { tmpdir } from "node:os"
+import { tmpdir, userInfo } from "node:os"
 import { dirname, join } from "node:path"
 import { after, beforeEach, test } from "node:test"
 import { fileURLToPath } from "node:url"
@@ -594,6 +594,94 @@ test("getAccessToken: a STALE lock the filesystem refuses to remove is waited ou
             chmodSync(ciwgDir, 0o700)
         }
         rmSync(lock, { recursive: true, force: true })
+    }
+})
+
+test("getAccessToken: a lock that can be neither stat'ed nor removed (deny ACL) is waited out inside the deadline, yielding to the event loop", async (t) => {
+    // The second spin shape, distinct from EBUSY above: an explicit deny ACE
+    // on auth.lock itself. mkdir → EEXIST, stat → EPERM, rm → EPERM, and
+    // existsSync → false — so a loop that trusts existsSync to decide "gone,
+    // retry at once" spins synchronously for ever (0 event-loop ticks). Two
+    // guards, each sufficient: lockIsStale() treats a non-ENOENT stat error
+    // as LIVE, and acquireLock allows one immediate retry per poll cycle.
+    // Windows: `icacls <lock> /deny <user>:(F)` in the throwaway HOME.
+    // POSIX: chmod 000 on the parent — but there mkdir reports EACCES, not
+    // EEXIST (the lock is "unlockable", not "held"), so the probe below
+    // skips; the EBUSY variant covers the POSIX refusal.
+    seedAuth()
+    const lock = join(ciwgDir, "auth.lock")
+    mkdirSync(lock)
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(lock, old, old) // stale mtime (no pid file): pre-fix lockIsStale() said "stale"
+    const user = userInfo().username
+    const icacls = (...args) =>
+        execFileSync("icacls", [lock, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+    let denied = false
+    if (process.platform === "win32") {
+        try {
+            icacls("/deny", `${user}:(F)`)
+            denied = true
+        } catch (error) {
+            t.skip(`icacls could not apply a deny ACE: ${error.message.split("\n")[0]}`)
+            return
+        }
+    } else {
+        chmodSync(ciwgDir, 0o000)
+    }
+    const errorCodeOf = (fn) => {
+        try {
+            fn()
+            return null
+        } catch (error) {
+            return error.code ?? "unknown"
+        }
+    }
+    try {
+        // Precondition: the exact shape — held per mkdir, opaque to stat and
+        // rm. Anything else (root, an exotic filesystem, POSIX) has nothing
+        // to test here.
+        const shape = {
+            mkdir: errorCodeOf(() => mkdirSync(lock, { recursive: false })),
+            stat: errorCodeOf(() => statSync(lock)),
+            rm: errorCodeOf(() => rmSync(lock, { recursive: true, force: true })),
+        }
+        if (shape.mkdir !== "EEXIST" || shape.stat === null || shape.rm === null) {
+            t.skip(`platform cannot reproduce the deny-ACL lock shape: ${JSON.stringify(shape)}`)
+            return
+        }
+
+        const fetchImpl = mockFetch({
+            [META.token_endpoint]: () => json({ access_token: "must-not-happen", expires_in: 300 }),
+        })
+        let ticks = 0
+        const ticker = setInterval(() => {
+            ticks += 1
+        }, 10)
+        const t0 = Date.now()
+        // lockWaitBudget = 3000 - API_RESERVE - MIN_HTTP = 750ms; the whole
+        // call must come back inside the 3 s deadline (+ slop), not spin.
+        const deadline = Date.now() + 3_000
+        const result = await getAccessToken({ fetchImpl, deadline })
+        const elapsed = Date.now() - t0
+        clearInterval(ticker)
+        assert.deepEqual(result, { token: null, reason: "busy" })
+        assert.ok(Date.now() < deadline + 1_000, `returned ${elapsed}ms after t0 — past the 3 s deadline`)
+        assert.ok(elapsed >= 600 && elapsed < 2_000, `waited ${elapsed}ms (budget 750ms)`)
+        assert.ok(ticks >= 5, `event loop ticked ${ticks} times — the wait must be asynchronous`)
+        assert.equal(fetchImpl.calls.length, 0, "never refreshed past a lock it could not take")
+        assert.equal(readAuth().refresh_token, "refresh-1", "tokens kept")
+    } finally {
+        if (denied) {
+            try {
+                icacls("/remove:d", user)
+            } catch {
+                icacls("/reset")
+            }
+        } else if (process.platform !== "win32") {
+            chmodSync(ciwgDir, 0o700)
+        }
+        rmSync(lock, { recursive: true, force: true })
+        assert.ok(!existsSync(lock), "deny ACE restored and lock removed")
     }
 })
 

@@ -472,8 +472,13 @@ function lockIsStale() {
     }
     try {
         return Date.now() - statSync(lockPath()).mtimeMs > LOCK_STALE_MS
-    } catch {
-        return true // vanished between our mkdir and the stat
+    } catch (error) {
+        // ENOENT: vanished between our mkdir and the stat → stale, retry.
+        // Anything else (EPERM/EACCES — a deny ACL on auth.lock, an
+        // unreadable lock) means we cannot judge its age: treat it as LIVE
+        // and wait out the deadline. Calling it stale would have us try to
+        // remove a directory we cannot even stat, and fail, on every turn.
+        return error.code === "ENOENT"
     }
 }
 
@@ -485,6 +490,12 @@ function lockIsStale() {
 async function acquireLock(sleep, waitMs) {
     const deadline = Date.now() + waitMs
     let stuckReported = false
+    // At most ONE immediate mkdir retry per poll cycle, whatever the
+    // filesystem reports: every second pass reaches the deadline check and
+    // the await below, so the loop is bounded even where existsSync and
+    // mkdir disagree (a deny ACL on auth.lock: mkdir says EEXIST, existsSync
+    // says false — trusting existsSync alone spun here forever, synchronously).
+    let retriedThisCycle = false
     for (;;) {
         try {
             mkdirSync(lockPath(), { recursive: false })
@@ -499,13 +510,16 @@ async function acquireLock(sleep, waitMs) {
         }
         if (lockIsStale()) {
             rmQuiet(lockPath(), { recursive: true })
-            // Gone → retry the mkdir at once. Still there (Windows EBUSY —
-            // Defender or the indexer holding auth.lock/pid — an ACL, a
+            // Gone → retry the mkdir at once (once). Still there (Windows
+            // EBUSY — Defender or the indexer holding auth.lock/pid — a
             // sibling that re-took it in between) → no free pass: fall
             // through to the deadline check and the poll sleep like any
             // live lock. A bare `continue` here spins SYNCHRONOUSLY for as
             // long as the directory resists, ignoring the budget.
-            if (!existsSync(lockPath())) continue
+            if (!retriedThisCycle && !existsSync(lockPath())) {
+                retriedThisCycle = true
+                continue
+            }
             if (!stuckReported) {
                 stuckReported = true
                 debug("stale auth.lock could not be removed — waiting as if live")
@@ -513,6 +527,7 @@ async function acquireLock(sleep, waitMs) {
         }
         if (Date.now() >= deadline) return "busy"
         await sleep(LOCK_POLL_MS)
+        retriedThisCycle = false
     }
 }
 

@@ -161,7 +161,7 @@ its own token, and flags the server in `/mcp` → **Re-authenticate** when
 a refresh is rejected). Claude Code's native flow redirects to
 `http://localhost:PORT/callback`, which is *not* in the baseline Authentik
 redirect list below — an admin must add the regex
-`http://localhost:\d+/callback` to the same application before this
+`^http://localhost:\d+/callback$` to the same application before this
 optional path works.
 
 ## Legacy API tokens (CI, service use) — still supported, deprecated for people
@@ -284,13 +284,15 @@ Settings, assuming slug `ciwg-knowledge`:
 |---|---|---|
 | Client type | **Public** | Every client runs on a laptop or in a browser — no secret can be kept; PKCE protects the code |
 | Client ID | `ciwg-knowledge` | The plugin default (`CIWG_OIDC_CLIENT_ID` overrides); the API's expected audience |
-| Redirect URIs — all in this one app | strict `https://claude.ai/api/mcp/auth_callback`, strict `https://claude.com/api/mcp/auth_callback`, **regex** `http://127\.0\.0\.1:\d+/callback` | The two strict entries are the claude.ai / Claude Desktop connector callbacks; the regex is `login.mjs`, which binds `127.0.0.1` on a random port (RFC 8252 loopback — Authentik strict matching cannot express a random port). Add regex `http://localhost:\d+/callback` only if someone uses the optional Claude Code native-OAuth path |
+| Redirect URIs — all in this one app | **strict** `https://claude.ai/api/mcp/auth_callback`, **strict** `https://claude.com/api/mcp/auth_callback`, **regex** `^http://127\.0\.0\.1(:\d+)?/callback$` | The two strict entries are the claude.ai / Claude Desktop connector callbacks; the regex is `login.mjs`, which binds `127.0.0.1` on a random port (RFC 8252 loopback — a strict entry cannot express a random port). Regex entries are matched against the whole redirect URI, so escape the dots and anchor with `^…$`. Add regex `^http://localhost:\d+/callback$` only if someone uses the optional Claude Code native-OAuth path |
 | Scopes / property mappings | `openid`, `profile`, `email`, **`offline_access`** (Authentik's default `profile` mapping already emits the `groups` claim; a dedicated `groups` mapping is optional — Authentik ignores a requested scope that has no mapping) | `offline_access` is what makes Authentik issue a refresh token (2024.2+); `groups` lets the API apply the staff gate |
 | Access token validity | `minutes=10` … `minutes=15` | This bounds how long a deactivated user keeps access (default is `hours=1` — too long) |
 | Refresh token validity | e.g. `days=30` | Long-lived; the user re-logs in when it lapses. Deactivation deletes it immediately |
 | Signing key | set (RS256) | Access tokens must be JWTs the API can verify offline |
 | Device code flow (optional, for SSH users) | Create a flow with designation **Stage Configuration** and set it as the brand's **Default code flow** (System → Brands) | Authentik ships no default; without it `/ciwg-login` over SSH fails with a clear message and the browser flow still works |
 | Users | staff group only, via the application's policy bindings | Removal from the group / deactivation = access ends within one access-token lifetime |
+
+Version note: the per-entry **strict / regex** selector is the CVE-2024-52289 fix (2024.8.5, 2024.10.3 and every 2024.12.x — the CIWG instance runs 2024.12.3), and the upgrade migration marks every pre-existing entry *strict*, so re-check the mode of the loopback regex after any upgrade; on an older instance there is no selector — every line is a regex matched in full — so enter the two connector callbacks as `^https://claude\.ai/api/mcp/auth_callback$` and `^https://claude\.com/api/mcp/auth_callback$` there.
 
 Server side (ci-connect): the API must accept this application's tokens
 (issuer `https://sso.ciwgserver.com/application/o/ciwg-knowledge/`,
