@@ -349,7 +349,10 @@ export function renderHits(hits, { maxChars = 1500, maxHits = 3 } = {}) {
         const score =
             typeof hit.score === "number" ? hit.score.toFixed(2) : "?"
         const source = `${hit.sourceType}:${hit.sourceId}#${hit.chunkIndex}`
-        const org = hit.organizationId != null ? ` org:${hit.organizationId}` : ""
+        const org =
+            typeof hit.organizationId === "number"
+                ? ` org:${hit.organizationId}`
+                : ""
         // Same wrapper, same risk as renderEngramLines: knowledge content
         // (and source pointers) are untrusted — escape so nothing can close
         // the <company-knowledge> framing early.
