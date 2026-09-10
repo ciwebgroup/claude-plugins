@@ -751,7 +751,7 @@ test("budget: every hooks.json timeout covers HOOK_BUDGET_MS plus start-up/flush
     const timeouts = Object.values(hooks).flatMap((groups) =>
         groups.flatMap((group) => group.hooks.map((h) => h.timeout))
     )
-    assert.equal(timeouts.length, 3)
+    assert.equal(timeouts.length, 4) // UserPromptSubmit, SessionStart, SessionEnd, Stop
     for (const seconds of timeouts) {
         assert.ok(seconds * 1000 >= HOOK_BUDGET_MS + 500, `hook timeout ${seconds}s < budget ${HOOK_BUDGET_MS}ms + margin`)
     }
