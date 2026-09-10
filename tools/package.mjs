@@ -141,7 +141,7 @@ export function buildCodePackage({ pluginDir = PLUGIN_DIR } = {}) {
         // The two zip FILE names (`ciwg-knowledge-<v>.zip`,
         // `ciwg-knowledge-desktop-<v>.zip`) are a contract with ci-connect's
         // plugin-package route (ASSET_PATTERNS) and the release notes — the
-        // source manifest's name is pinned by tests/package.test.mjs.
+        // source manifest's name is pinned by plugins/ciwg-knowledge/tests/package.test.mjs.
         file: `${manifest.name}-${manifest.version}.zip`,
         pluginName: manifest.name,
         version: manifest.version,
@@ -183,7 +183,7 @@ What you will see: the sign-in page opens once. Claude only asks you to connect 
 
 ## Also running Claude Code on this machine?
 
-This is the plugin **${pluginName}**; the Claude Code package (\`${codePluginName}-<version>.zip\`, unzipped into \`~/.claude/skills/${codePluginName}\`) is a different plugin, **${codePluginName}**. Claude Desktop registers an uploaded plugin in the same plugin registry Claude Code reads, so both appear in Claude Code — side by side, each under its own name. (Before 0.3.2 the two shared a name and this upload silently replaced the Code plugin there: no hooks, no automatic sign-in.) In Claude Code, \`/mcp\` lists this plugin's **CIWG Knowledge** connector as *requires authentication* until you authenticate it there — optional, because the Code plugin already injects the same knowledge; authenticate it only if you also want the remote connector's tools in Claude Code. If you would rather not have the duplicate, skip this upload on that machine and add the custom connector in Claude Desktop instead (next section).
+This is the plugin **${pluginName}**; the Claude Code package (\`${codePluginName}-<version>.zip\`, unzipped into \`~/.claude/skills/${codePluginName}\`) is a different plugin, **${codePluginName}**. Claude Desktop registers an uploaded plugin in the same plugin registry Claude Code reads, so both appear in Claude Code — side by side, each under its own name, so the company-knowledge skill and the CIWG Knowledge connector each show up twice there, once per plugin. (Before 0.3.2 the two shared a name and this upload silently replaced the Code plugin there: no hooks, no automatic sign-in.) In Claude Code, \`/mcp\` lists this plugin's **CIWG Knowledge** connector as *requires authentication* until you authenticate it there — optional, because the Code plugin already injects the same knowledge; authenticate it only if you also want the remote connector's tools in Claude Code. If you would rather not have the duplicate, skip this upload on that machine and add the custom connector in Claude Desktop instead (next section).
 
 ## Claude Desktop chat / claude.ai chat — unverified
 
