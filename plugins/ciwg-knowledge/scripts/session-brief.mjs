@@ -25,16 +25,13 @@
  * Proactive refresh: a token that expires within 5 minutes is refreshed
  * here, at session start, so the per-prompt hooks never pay for it.
  *
- * Knowledge brief: fires only in repos whose .ciwg-client.json carries BOTH
- * an organizationId and a clientName: the org id server-side-filters the
- * search (a name-only lexical match can surface OTHER clients' data), and
- * the name is the query seed. Unmapped repos get no knowledge brief.
- *
- * Engram (team activity): today's activity digests, org-filtered when the
- * repo is client-mapped, else filtered to this git repo's name — so an
- * unmapped internal repo still shows who else touched it today. Secondary
- * by design: small line budget, never crowds out knowledge snippets.
- * Fires on real startup/resume only, never after compaction.
+ * The brief itself comes from the knowledge API's injection endpoint: the
+ * hook sends the session's facts (client mapping, repo, branch) and emits
+ * the returned context verbatim. The server decides what a session start
+ * gets (the mapped client's latest knowledge, today's team memory ordered
+ * by overlap with this session) — policy changes with a deploy, never a
+ * plugin release. Fires on real startup/resume only, never after
+ * compaction.
  *
  * Same fail-open discipline as inject-context: any failure exits 0 silent.
  * Every call is bounded by the hook deadline (hooks.json timeout).
@@ -51,20 +48,15 @@ import {
     spawnAutoLogin,
 } from "./lib/auth.mjs"
 import {
-    TRUST_PREAMBLE,
     debug,
     emit,
-    escapeXml,
     getClientMapping,
     hookDeadline,
-    listEngramActivities,
+    postInject,
     readStdin,
-    renderEngramLines,
-    renderHits,
     resolveCredential,
-    searchKnowledge,
 } from "./lib/config.mjs"
-import { detectRepoName } from "./lib/engram.mjs"
+import { collectGitFacts, detectRepoName } from "./lib/engram.mjs"
 import { remainingMs } from "./lib/paths.mjs"
 import { readState, updateState } from "./lib/state.mjs"
 import { spawn } from "node:child_process"
@@ -171,70 +163,35 @@ try {
     }
 
     const mapping = getClientMapping(payload.cwd)
-    const hasFullMapping = Boolean(
-        mapping?.clientName && mapping.organizationId
-    )
-    const repoName =
-        mapping?.organizationId != null ? null : detectRepoName(payload.cwd, { deadline })
-
-    const [knowledge, engram] = await Promise.all([
-        hasFullMapping
-            ? searchKnowledge(
-                  {
-                      q: mapping.clientName,
-                      organizationId: mapping.organizationId,
-                      limit: 5,
-                      minScore: 0.2,
-                  },
-                  { deadline }
-              )
-            : Promise.resolve(null),
-        listEngramActivities(
-            {
-                organizationId: mapping?.organizationId,
-                repo: repoName,
-                limit: 5,
+    const repo = detectRepoName(payload.cwd, { deadline })
+    const git = repo ? collectGitFacts(payload.cwd, { deadline }) : {}
+    const result = await postInject(
+        {
+            event: "session-start",
+            sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
+            facts: {
+                repo,
+                branch: git?.branch ?? null,
+                organizationId: mapping?.organizationId ?? null,
+                clientName: mapping?.clientName ?? null,
+                paths: Array.isArray(git?.topPaths) ? git.topPaths.slice(0, 10) : [],
             },
-            { deadline }
-        ),
-    ])
+        },
+        { deadline }
+    )
 
-    if (knowledge?.status === "api-rejected" || engram.status === "api-rejected") {
+    if (result.status === "api-rejected") {
         const text = signInHint("api-rejected", payload.session_id)
         if (text) await hint(text)
     }
 
-    const renderedHits =
-        knowledge?.ok && knowledge.data?.hits?.length
-            ? renderHits(knowledge.data.hits, { maxChars: 1800, maxHits: 5 })
-            : ""
-    const engramLines = engram.ok
-        ? renderEngramLines(engram.data?.activities ?? [])
-        : ""
-
-    const sections = []
-    if (renderedHits) sections.push(renderedHits)
-    if (engramLines) {
-        sections.push(
-            `Team activity today (engram — structured session digests):\n${engramLines}`
-        )
-    }
-    if (sections.length === 0) {
-        debug("nothing to inject (no hits, no team activity)")
+    const context = result.ok && typeof result.data?.context === "string" ? result.data.context : ""
+    if (!context) {
+        debug(result.ok ? "server injected nothing" : `inject call failed: ${result.status}`)
         process.exit(0)
     }
-
-    const clientAttr = hasFullMapping
-        ? ` client="${escapeXml(mapping.clientName)}"`
-        : ""
     await emit({
-        hookSpecificOutput: {
-            hookEventName: "SessionStart",
-            additionalContext:
-                `<company-knowledge${clientAttr} auto-retrieved="true">\n` +
-                `${TRUST_PREAMBLE}\n${sections.join("\n")}\n` +
-                `</company-knowledge>`,
-        },
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
     })
     process.exit(0)
 } catch (error) {

@@ -172,8 +172,8 @@ and use the custom connector in Desktop (Install, above).
 
 | Surface | When it fires | What it does |
 |---|---|---|
-| `SessionStart` hook | opening/resuming a session (never after compaction) | Opens the SSO sign-in by itself when there is none (once a day, see above); refreshes a sign-in that is about to expire; injects a short client brief in client-mapped repos — requires BOTH `organizationId` and `clientName` in the mapping — and today's Engram team activity (org-filtered when mapped, else filtered to this git repo's name) |
-| `UserPromptSubmit` hook | every substantive prompt | Searches the knowledge API with your prompt; injects up to 3 relevant snippets (score-gated — quiet prompts inject nothing), plus a compact "team activity today" tail (Engram) |
+| `SessionStart` hook | opening/resuming a session (never after compaction) | Opens the SSO sign-in by itself when there is none (once a day, see above); refreshes a sign-in that is about to expire; asks the knowledge API for a session brief — the mapped client's latest knowledge (requires BOTH `organizationId` and `clientName` in the mapping) and today's Engram team activity, teammates on the same repo or client first |
+| `UserPromptSubmit` hook | every substantive prompt | Sends the prompt and the session's facts (repo, branch, client) to the knowledge API's injection endpoint and injects the answer verbatim: knowledge that literally names what you asked about (the source summary, enough to answer from — similarity alone never injects), plus today's team activity ordered by overlap with your session. **All of that policy lives on the server** — it changes with a deploy, not a plugin release |
 | `SessionEnd` hook | closing a session in a git repo or client-mapped directory | Posts a small STRUCTURED activity digest (Engram) so teammates' sessions know what you worked on — see "Engram" below |
 | MCP tools | when you or Claude explicitly ask (the skill says when) | `search_company_knowledge`, `get_source_artifacts` — a local stdio server that uses the same sign-in as the hooks; a tool call without a sign-in opens the browser sign-in itself and answers "finish signing in, then ask again" |
 | `company-knowledge` skill | model-invoked | Tells Claude to search company knowledge before answering client/meeting questions and to cite sources |
@@ -387,7 +387,7 @@ remains for a private repo with a server-side read-only token.
 
 `npm test` — or `node --test` with the four files under `tests/`:
 
-- `engram.test.mjs` — digest construction, opt-outs, fail-open, rendering.
+- `engram.test.mjs` — digest construction, opt-outs, fail-open (injection rendering is tested server-side).
 - `auth.test.mjs` — PKCE, discovery, the token cache and silent refresh,
   the lock, the hook time budget, legacy-token precedence, the loopback
   and device flows end to end, logout, the hint cadence, the hooks as real
