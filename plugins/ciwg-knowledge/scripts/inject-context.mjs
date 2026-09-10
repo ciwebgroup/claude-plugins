@@ -30,7 +30,7 @@ import {
     postInject,
     readStdin,
 } from "./lib/config.mjs"
-import { collectGitFacts, detectRepoName } from "./lib/engram.mjs"
+import { detectBranch, detectRepoName } from "./lib/engram.mjs"
 
 /** Below this the server would not look anyway — save the round trip. */
 const MIN_PROMPT_CHARS = 15
@@ -53,9 +53,11 @@ try {
     }
     const deadline = hookDeadline()
 
+    // Repo + branch only (two instant git calls). Never `git status` here:
+    // on a large checkout it takes seconds and starves the API call.
     const mapping = getClientMapping(payload.cwd)
     const repo = detectRepoName(payload.cwd, { deadline })
-    const git = repo ? collectGitFacts(payload.cwd, { deadline }) : {}
+    const branch = repo ? detectBranch(payload.cwd, { deadline }) : null
     const result = await postInject(
         {
             event: "prompt",
@@ -63,10 +65,10 @@ try {
             sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
             facts: {
                 repo,
-                branch: git?.branch ?? null,
+                branch,
                 organizationId: mapping?.organizationId ?? null,
                 clientName: mapping?.clientName ?? null,
-                paths: Array.isArray(git?.topPaths) ? git.topPaths.slice(0, 10) : [],
+                paths: [],
             },
         },
         { deadline }

@@ -68,6 +68,18 @@ export function detectRepoName(cwd, { deadline } = {}) {
     return toplevel ? basename(toplevel) : null
 }
 
+/**
+ * Current branch, or null (detached HEAD, not a repo, no budget). One
+ * instant git call — the read-side hooks want repo + branch and NOTHING
+ * that walks the working tree: `git status` on a large checkout can take
+ * seconds on Windows and would eat the budget the API call needs.
+ */
+export function detectBranch(cwd, { deadline } = {}) {
+    if (!cwd) return null
+    const branch = git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"], deadline)?.trim()
+    return branch && branch !== "HEAD" ? branch.slice(0, 200) : null
+}
+
 /** One porcelain status line → the path it names (rename → new path). */
 function statusLinePath(line) {
     const path = line.slice(3).trim()

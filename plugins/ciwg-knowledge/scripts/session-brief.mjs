@@ -56,7 +56,7 @@ import {
     readStdin,
     resolveCredential,
 } from "./lib/config.mjs"
-import { collectGitFacts, detectRepoName } from "./lib/engram.mjs"
+import { detectBranch, detectRepoName } from "./lib/engram.mjs"
 import { remainingMs } from "./lib/paths.mjs"
 import { readState, updateState } from "./lib/state.mjs"
 import { spawn } from "node:child_process"
@@ -162,19 +162,21 @@ try {
         await handleNoCredential(auth.status, payload.session_id, payload.source, deadline)
     }
 
+    // Repo + branch only (two instant git calls) — never `git status` on
+    // the read path, it can take seconds on a large checkout.
     const mapping = getClientMapping(payload.cwd)
     const repo = detectRepoName(payload.cwd, { deadline })
-    const git = repo ? collectGitFacts(payload.cwd, { deadline }) : {}
+    const branch = repo ? detectBranch(payload.cwd, { deadline }) : null
     const result = await postInject(
         {
             event: "session-start",
             sessionId: typeof payload.session_id === "string" ? payload.session_id : null,
             facts: {
                 repo,
-                branch: git?.branch ?? null,
+                branch,
                 organizationId: mapping?.organizationId ?? null,
                 clientName: mapping?.clientName ?? null,
-                paths: Array.isArray(git?.topPaths) ? git.topPaths.slice(0, 10) : [],
+                paths: [],
             },
         },
         { deadline }
