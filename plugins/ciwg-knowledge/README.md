@@ -33,7 +33,11 @@ against Anthropic's docs, 2026-09-09 — see "What runs where").
 
 1. In Claude Desktop open **Customize → Plugins → Add plugin → Upload
    plugin** and choose the zip (Claude accepts `.zip` only). It installs
-   as the plugin `ciwg-knowledge-desktop`.
+   as the plugin `ciwg-knowledge-desktop`. **Upgrading from 0.3.1 or
+   earlier?** Remove the old `ciwg-knowledge` plugin first (Customize →
+   Plugins, or `claude plugin uninstall ciwg-knowledge@local-desktop-app-uploads`)
+   — the name changed, so this upload adds a plugin rather than replacing
+   the old one.
 2. Open the installed plugin, find the **CIWG Knowledge** connector and
    click **Connect**. Sign in with CIWG SSO and approve access.
 3. Done. Ask about a client, a meeting or a decision — Claude searches
@@ -153,11 +157,13 @@ an installed plugin takes precedence over a same-named one under
 on a machine with the Code zip unzipped AND the Desktop zip uploaded,
 Claude Code silently swapped the Code plugin for the hook-less Desktop
 one — no auto-injection, no automatic sign-in (Troubleshooting, below).
-Since 0.3.2 the names differ and both load side by side: Claude Code
-lists the Desktop plugin's connector as *requires authentication* until
-you authenticate it with `/mcp` — optional there, the Code plugin already
-injects the same knowledge. Prefer no duplicate? Skip the Desktop upload
-on that machine and use the custom connector in Desktop (Install, above).
+Since 0.3.2 the names differ and both load side by side — the
+`company-knowledge` skill and the CIWG Knowledge connector each appear
+twice in Claude Code, once per plugin: Claude Code lists the Desktop
+plugin's connector as *requires authentication* until you authenticate it
+with `/mcp` — optional there, the Code plugin already injects the same
+knowledge. Prefer no duplicate? Skip the Desktop upload on that machine
+and use the custom connector in Desktop (Install, above).
 
 ## What you get (Claude Code)
 
@@ -279,8 +285,9 @@ should remove it (the automatic sign-in never runs while one is set).
   (ciwg-knowledge@local-desktop-app-uploads), which takes precedence`** —
   a pre-0.3.2 Desktop zip was uploaded into Claude Desktop on this
   machine; it registered under the same name and shadows the Code plugin
-  (no hooks, no automatic sign-in). Run
-  `claude plugin uninstall ciwg-knowledge@local-desktop-app-uploads`,
+  (no hooks, no automatic sign-in). Remove that upload — in Claude
+  Desktop, Customize → Plugins → the `ciwg-knowledge` plugin → remove; or
+  `claude plugin uninstall ciwg-knowledge@local-desktop-app-uploads` —
   restart Claude Code, then — if you want the Desktop variant — re-upload
   the 0.3.2 Desktop zip; it installs as `ciwg-knowledge-desktop` and the
   two coexist ("What runs where").

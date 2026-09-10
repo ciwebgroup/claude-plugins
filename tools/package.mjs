@@ -138,6 +138,10 @@ export function buildCodePackage({ pluginDir = PLUGIN_DIR } = {}) {
     const sorted = sortEntries(entries)
     return {
         target: "code",
+        // The two zip FILE names (`ciwg-knowledge-<v>.zip`,
+        // `ciwg-knowledge-desktop-<v>.zip`) are a contract with ci-connect's
+        // plugin-package route (ASSET_PATTERNS) and the release notes — the
+        // source manifest's name is pinned by tests/package.test.mjs.
         file: `${manifest.name}-${manifest.version}.zip`,
         pluginName: manifest.name,
         version: manifest.version,
@@ -171,7 +175,7 @@ function desktopReadme({ version, mcpUrl, clientId, pluginName, codePluginName }
 
 Three steps in Claude Cowork, no tokens:
 
-1. In Claude Desktop, open **Customize → Plugins → Add plugin → Upload plugin** and choose this zip. It installs as the plugin **${pluginName}**.
+1. In Claude Desktop, open **Customize → Plugins → Add plugin → Upload plugin** and choose this zip. It installs as the plugin **${pluginName}**. Upgrading from 0.3.1 or earlier? Remove the old \`${codePluginName}\` upload first (Customize → Plugins, or \`claude plugin uninstall ${codePluginName}@local-desktop-app-uploads\`) — the name changed, so this upload adds a plugin rather than replacing it.
 2. Open the installed plugin, find the **CIWG Knowledge** connector and click **Connect**. Sign in with your normal CIWG SSO login (Authentik, MFA included) and approve access.
 3. Done. Ask Claude about a client, a meeting or a past decision — the bundled skill makes it search company knowledge first and cite its sources.
 
