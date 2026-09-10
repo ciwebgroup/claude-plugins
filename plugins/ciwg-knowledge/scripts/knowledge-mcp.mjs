@@ -94,7 +94,12 @@ const TOOLS = [
                     description:
                         "Restrict to one ingested source type (e.g. fathom-meeting, call-transcript, chat-log, helpdesk-ticket, engram-day). The API rejects unknown values with a 400 that lists the current set.",
                 },
-                limit: { type: "integer", minimum: 1, maximum: 20 },
+                limit: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 8,
+                    description: "Sources to return (default 5, max 8) — one best chunk per source, the source's summary once, the whole answer capped at ~20k characters",
+                },
             },
             required: ["q"],
         },
@@ -102,7 +107,7 @@ const TOOLS = [
     {
         name: "get_source_artifacts",
         description:
-            "The agentic-analysis outputs (summary, action items, entities, sentiment) for ONE ingested source — a whole meeting, call or ticket — addressed by the source pointer a search hit carries (source_type + source_id). Use it to go deeper on a hit before quoting it.",
+            "The full summary of ONE ingested source — a whole meeting, call or ticket — addressed by the source pointer a search hit carries (source_type + source_id). Use it when a search hit's clipped summary is not enough. Action items, entities and sentiment appear here only for sources that went through the LLM analysis stage; most Fathom meetings today carry the native summary alone.",
         inputSchema: {
             type: "object",
             properties: {
@@ -126,6 +131,15 @@ function replyError(id, code, message) {
 
 const text = (t) => ({ content: [{ type: "text", text: t }], isError: false })
 const errText = (t) => ({ content: [{ type: "text", text: t }], isError: true })
+
+/** UTF-16 clamp with an ellipsis (never splits a surrogate pair). */
+const clip = (s, n) => {
+    if (s.length <= n) return s
+    let cut = s.slice(0, n - 1)
+    const last = cut.charCodeAt(cut.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1)
+    return `${cut}…`
+}
 
 const clampInt = (value, min, max) => {
     const n = typeof value === "number" ? Math.floor(value) : Number(value)
@@ -213,7 +227,9 @@ async function callTool(name, args) {
                     typeof args.source_type === "string" && args.source_type
                         ? [args.source_type]
                         : undefined,
-                limit: clampInt(args.limit, 1, 20),
+                // Over-fetch chunks: several usually belong to one source
+                // and the answer keeps one per source.
+                limit: Math.min((clampInt(args.limit, 1, 8) ?? 5) * 3, 24),
             },
             toolOpts()
         )
@@ -221,15 +237,39 @@ async function callTool(name, args) {
             if (SIGN_IN_STATUSES.has(result.status)) return signInOnDemand(result.status)
             return errText(describeFailure(result.status))
         }
-        const hits = (result.data.hits ?? []).map((h) => ({
-            source: `${h.sourceType}:${h.sourceId}#${h.chunkIndex}`,
-            score: h.score,
-            organizationId: h.organizationId,
-            summary: h.summary,
-            content: String(h.content ?? "").slice(0, 1200),
-            createdAt: h.createdAt,
-        }))
-        return text(JSON.stringify({ mode: result.data.mode, hits }, null, 2))
+        const sources = clampInt(args.limit, 1, 8) ?? 5
+        // One hit per source (the best-scoring chunk), the summary once and
+        // clipped, the whole answer capped: a 15-hit page that repeats a
+        // 5k-char meeting summary per chunk blew the tool-output limit.
+        const hits = []
+        const seen = new Set()
+        let chars = 0
+        for (const h of result.data.hits ?? []) {
+            const sourceKey = `${h.sourceType}:${h.sourceId}`
+            if (seen.has(sourceKey)) continue
+            const hit = {
+                source: `${sourceKey}#${h.chunkIndex}`,
+                score: h.score,
+                ...(typeof h.matched === "string" ? { matched: h.matched } : {}),
+                organizationId: h.organizationId,
+                summary: typeof h.summary === "string" ? clip(h.summary, 1500) : null,
+                content: clip(String(h.content ?? ""), 700),
+                createdAt: h.createdAt,
+            }
+            const size = JSON.stringify(hit).length
+            if (hits.length > 0 && chars + size > 20_000) break
+            seen.add(sourceKey)
+            hits.push(hit)
+            chars += size
+            if (hits.length >= sources) break
+        }
+        return text(
+            JSON.stringify(
+                { mode: result.data.mode, ...(result.data.entities ? { entities: result.data.entities } : {}), hits },
+                null,
+                2
+            )
+        )
     }
     if (name === "get_source_artifacts") {
         const result = await getSourceArtifacts(

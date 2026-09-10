@@ -336,27 +336,58 @@ const clip = (s, n) => {
     return `${cut}…`
 }
 
-/** Compact, citation-first rendering of hits for context injection.
- * Defensive about shapes — a malformed hit is skipped, never thrown on. */
-export function renderHits(hits, { maxChars = 1500, maxHits = 3 } = {}) {
+/**
+ * Citation-first rendering of hits for context injection.
+ *
+ * INJECTION POLICY (per source type — the table grows as sources do):
+ * meetings, calls, tickets and notes are injected ONLY when the chunk
+ * literally names something the prompt asked about (`hit.matched`, the
+ * API's entity boost). Similarity scores alone cannot gate them: an
+ * unrelated Fathom summary routinely scores 0.6+ because every summary
+ * shares the same shape, so a score floor either injects noise on every
+ * prompt or nothing at all. A name match is the one high-precision signal
+ * we have today; org scoping joins it once attribution lands. Daily team
+ * memory (engram) is rendered separately by renderEngramLines.
+ *
+ * A matched hit gets enough to answer from: the source's summary once (up
+ * to `summaryChars`), later chunks of the same source their own text — so
+ * the model can skip the tool call, which is the point of injecting.
+ * Defensive about shapes — a malformed hit is skipped, never thrown on.
+ */
+export function renderHits(
+    hits,
+    { maxChars = 3200, maxHits = 3, summaryChars = 1500, matchedOnly = true } = {}
+) {
     const lines = []
+    const summarised = new Set()
     let used = 0
-    for (const hit of hits.slice(0, maxHits)) {
+    const chosen = matchedOnly
+        ? hits.filter((h) => typeof h?.matched === "string" && h.matched.trim())
+        : hits
+    for (const hit of chosen.slice(0, maxHits)) {
         const content = typeof hit.content === "string" ? hit.content : ""
         const summary = typeof hit.summary === "string" ? hit.summary : ""
-        const bodyRaw = (summary ? `${summary} — ` : "") + content
+        const sourceKey = `${hit.sourceType}:${hit.sourceId}`
+        const useSummary = summary && !summarised.has(sourceKey)
+        if (useSummary) summarised.add(sourceKey)
+        const bodyRaw = useSummary ? summary : content
         if (!bodyRaw.trim()) continue
         const score =
             typeof hit.score === "number" ? hit.score.toFixed(2) : "?"
-        const source = `${hit.sourceType}:${hit.sourceId}#${hit.chunkIndex}`
+        const source = `${sourceKey}#${hit.chunkIndex}`
         const org =
             typeof hit.organizationId === "number"
                 ? ` org:${hit.organizationId}`
                 : ""
+        const names =
+            typeof hit.matched === "string" && hit.matched.trim()
+                ? ` names:${escapeXml(hit.matched.trim())}`
+                : ""
         // Same wrapper, same risk as renderEngramLines: knowledge content
         // (and source pointers) are untrusted — escape so nothing can close
         // the <company-knowledge> framing early.
-        const line = `- [${escapeXml(source)}${org} score:${score}] ${escapeXml(clip(bodyRaw.replace(/\s+/g, " "), 420))}`
+        const body = escapeXml(clip(bodyRaw.replace(/\s+/g, " "), useSummary ? summaryChars : 420))
+        const line = `- [${escapeXml(source)}${org} score:${score}${names}] ${body}`
         if (used + line.length > maxChars) break
         lines.push(line)
         used += line.length
