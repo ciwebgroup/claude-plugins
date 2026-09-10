@@ -15,6 +15,11 @@
  *   idp_down_until           sign-in server unreachable → skip refreshes until
  *                            then (separate from api_down: an IdP outage must
  *                            not silence knowledge lookups that still work)
+ *   auto_login_at            last automatic browser sign-in that had a link
+ *                            (or a sign-out) — once a day; auto_login_error/
+ *                            _error_at say how the last attempt failed and
+ *                            auto_login_hold_until holds the next one after
+ *                            an attempt that never got a link (IdP unreachable)
  *
  * Secrets never live here: tokens stay in auth.json (0600), a pending device
  * code in auth-pending.json (0600). Every function is fail-open — a missing

@@ -177,7 +177,10 @@ async function signInOnDemand(status) {
     }
     // "recent" (the daily hook cadence) is not binding for an explicit tool
     // call — the user just asked for knowledge — but this process does not
-    // reopen the browser more than the growing cooldown allows.
+    // reopen the browser more than the growing cooldown allows. "held" IS
+    // binding: the sign-in server could not be reached moments ago, so an
+    // attempt now would only answer "opened in your browser" about a tab
+    // that never opens — the manual /ciwg-login line is the honest answer.
     const allowed = (decision === "due" || decision === "recent") && now >= signInBlockedUntil
     if (!allowed) return errText(describeFailure(status))
     signInAttempts += 1

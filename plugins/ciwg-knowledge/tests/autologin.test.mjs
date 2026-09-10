@@ -95,7 +95,10 @@ const auth = await import("../scripts/lib/auth.mjs")
 const { readState, updateState } = await import("../scripts/lib/state.mjs")
 const {
     AUTO_LOGIN_CONTEXT,
+    AUTO_LOGIN_CONTEXT_HELD,
+    AUTO_LOGIN_HOLD_MS,
     AUTO_LOGIN_MESSAGE,
+    AUTO_LOGIN_MESSAGE_HELD,
     AUTO_LOGIN_MESSAGE_NO_URL,
     OIDC_CLIENT_ID,
     autoLoginDecision,
@@ -105,6 +108,8 @@ const {
     isAutoLoginOptedOut,
     isEndpointUrl,
     looksHeadless,
+    markAutoLoginFailed,
+    markAutoLoginStarted,
     publishAutoLoginUrl,
     readAuth,
     readAutoLoginMarker,
@@ -114,6 +119,10 @@ const {
     tryClaimAutoLogin,
     writeAuth,
 } = auth
+
+/** An issuer nobody listens on: discovery fails at once (ECONNREFUSED on
+ * the loopback discard port) — the "sign-in server unreachable" case. */
+const DEAD_ISSUER = "http://127.0.0.1:9/application/o/ciwg-knowledge/"
 
 const pluginDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 const scriptsDir = join(pluginDir, "scripts")
@@ -252,6 +261,29 @@ test("autoLoginDecision: only a missing/dropped sign-in is eligible; opt-out, he
     assert.equal(autoLoginDecision("no-token", { now: now + 24 * 60 * 60_000 }), "due")
     rmSync(join(ciwgDir, "state.json"), { force: true })
 
+    // Held: the last attempt never got a link (markAutoLoginFailed without
+    // one holds the next attempt for AUTO_LOGIN_HOLD_MS), or the refresh
+    // path found the sign-in server unreachable (idp_down_until). A link
+    // that existed leaves the daily cadence in charge; a new link clears
+    // the hold.
+    markAutoLoginFailed("discovery failed", now)
+    assert.equal(readState().auto_login_hold_until, now + AUTO_LOGIN_HOLD_MS)
+    assert.equal(autoLoginDecision("no-token", { now }), "held")
+    assert.equal(autoLoginDecision("relogin", { now }), "held")
+    assert.equal(autoLoginDecision("no-token", { now: now + AUTO_LOGIN_HOLD_MS }), "due", "the hold is over")
+    markAutoLoginStarted(now)
+    assert.equal(readState().auto_login_hold_until, undefined, "a link clears the hold")
+    assert.equal(autoLoginDecision("no-token", { now }), "recent", "…and stamps the day")
+    rmSync(join(ciwgDir, "state.json"), { force: true })
+    markAutoLoginFailed("timed out waiting for the browser sign-in", now, { hadUrl: true })
+    assert.equal(readState().auto_login_hold_until, undefined, "a tab that opened is paced by the daily stamp, not a hold")
+    assert.equal(autoLoginDecision("no-token", { now }), "due")
+    rmSync(join(ciwgDir, "state.json"), { force: true })
+    updateState({ idp_down_until: now + 30_000 })
+    assert.equal(autoLoginDecision("no-token", { now }), "held", "IdP backoff honoured")
+    assert.equal(autoLoginDecision("no-token", { now: now + 30_000 }), "due")
+    rmSync(join(ciwgDir, "state.json"), { force: true })
+
     // A live attempt (own pid, fresh) → in-progress; stale or dead → due.
     assert.equal(claimAutoLogin({ now }), true)
     assert.equal(autoLoginDecision("no-token", { now }), "in-progress")
@@ -386,10 +418,90 @@ test("beginBackgroundLogin: a flow that times out reports a failure without thro
     const failed = await stuck.done
     assert.equal(failed.ok, false)
     // No link ever existed, so no tab: the daily cadence is NOT stamped —
-    // the next session start may try again (the error is still on record).
-    assert.equal(readState().auto_login_at, undefined)
-    assert.match(readState().auto_login_error, /./)
-    assert.match(describeAuthStatus(), /retries at the next session start/)
+    // instead the automatic sign-in is HELD for a while (the error is on
+    // record), so an unreachable sign-in server does not cost every
+    // session start a doomed attempt.
+    const state = readState()
+    assert.equal(state.auto_login_at, undefined)
+    assert.match(state.auto_login_error, /./)
+    assert.ok(state.auto_login_hold_until > Date.now(), "held")
+    assert.ok(state.auto_login_hold_until <= Date.now() + AUTO_LOGIN_HOLD_MS)
+    assert.equal(autoLoginDecision("no-token"), "held")
+    assert.match(describeAuthStatus(), /Automatic sign-in: the last attempt failed \(.+\); it retries after \d{4}-\d{2}-\d{2}T/)
+})
+
+test("beginBackgroundLogin: a claim lost to a HALF-WRITTEN marker keeps following through the torn-read grace — the winner's link is relayed once it lands, and only a torn marker that outlives the grace ends the follow", async () => {
+    mkdirSync(ciwgDir, { recursive: true })
+    const torn = '{"version": 1, "pid": '
+    writeFileSync(markerPath, torn)
+    const now = Date.now()
+    assert.equal(tryClaimAutoLogin({ now }), "sibling")
+    const opened = []
+    const openBrowser = async (u) => opened.push(u)
+    const follower = beginBackgroundLogin({ urlTimeoutMs: 3_000, timeoutMs: 10_000, openBrowser })
+    // The old follower gave up on its first poll here (url null, done
+    // {ok:false, sibling:true} within a millisecond): a fresh unparsable
+    // marker is a sibling mid-write, so both promises must still be open.
+    const pending = () => sleep(400).then(() => "pending")
+    assert.equal(await Promise.race([follower.url, pending()]), "pending")
+    assert.equal(await Promise.race([follower.done, pending()]), "pending")
+    // The winner finishes its write and publishes the link…
+    const link = "https://sso.ciwgserver.com/application/o/authorize/?state=torn"
+    writeFileSync(markerPath, JSON.stringify({ version: 1, pid: process.pid, started_at: now, url: link, url_at: now }))
+    assert.equal(await follower.url, link, "relayed, not a link of its own")
+    // …and its sign-in lands.
+    writeAuth({ access_token: "a", expires_at: Date.now() + 60_000, refresh_token: "r", email: "torn@ciwebgroup.com" })
+    const result = await follower.done
+    assert.deepEqual(
+        { ok: result.ok, sibling: result.sibling, email: result.email },
+        { ok: true, sibling: true, email: "torn@ciwebgroup.com" }
+    )
+    assert.equal(opened.length, 0, "a follower opens nothing")
+    assert.equal(readState().auto_login_at, undefined, "…and stamps nothing")
+    rmSync(markerPath)
+    rmSync(authPath)
+
+    // A torn marker nobody ever completes: the follow ends once the file
+    // outlives the grace (a crashed writer), not before.
+    writeFileSync(markerPath, torn)
+    const orphan = beginBackgroundLogin({ urlTimeoutMs: 3_000, timeoutMs: 10_000, openBrowser })
+    assert.equal(await Promise.race([orphan.done, sleep(300).then(() => "pending")]), "pending")
+    const old = new Date(Date.now() - 10_000)
+    utimesSync(markerPath, old, old)
+    const t0 = Date.now()
+    assert.equal(await orphan.url, null)
+    const gaveUp = await orphan.done
+    assert.equal(gaveUp.ok, false)
+    assert.equal(gaveUp.sibling, true)
+    assert.match(gaveUp.error, /another session/)
+    assert.ok(Date.now() - t0 < 1_000, "gives up promptly once the marker is judged dead")
+    assert.equal(opened.length, 0)
+    assert.equal(readFileSync(markerPath, "utf8"), torn, "a follower never removes a marker")
+    rmSync(markerPath)
+})
+
+test("tryClaimAutoLogin: a regular FILE at ~/.ciwg (or a directory at the marker path) is \"unwritable\" — not a sibling that a follower would wait on and give up", async () => {
+    writeFileSync(ciwgDir, "not a directory")
+    const now = Date.now()
+    assert.equal(tryClaimAutoLogin({ now }), "unwritable")
+    assert.equal(claimAutoLogin({ now }), false)
+    assert.equal(readFileSync(ciwgDir, "utf8"), "not a directory", "left alone")
+    // Unclaimed, the flow still runs in THIS process — a link of its own
+    // inside the budget and an outcome of its own (no sibling flag) —
+    // instead of "following" a sibling that does not exist and reporting
+    // {ok:false, sibling:true} with no link at all.
+    const attempt = beginBackgroundLogin({ urlTimeoutMs: 2_000, timeoutMs: 300 })
+    assert.match(await attempt.url, /^http:\/\/127\.0\.0\.1:\d+\/authorize\?/)
+    const result = await attempt.done
+    assert.equal(result.ok, false)
+    assert.equal(result.sibling, undefined)
+    assert.match(result.error, /timed out/)
+    rmSync(ciwgDir, { force: true })
+
+    mkdirSync(markerPath, { recursive: true })
+    assert.equal(tryClaimAutoLogin({ now }), "unwritable")
+    assert.ok(existsSync(markerPath), "not removed")
+    rmSync(markerPath, { recursive: true, force: true })
 })
 
 test("beginBackgroundLogin: two attempts racing on one machine open ONE browser — the loser follows the winner's marker, relays its link and settles when its sign-in lands", async () => {
@@ -458,6 +570,29 @@ test("spawnAutoLogin: starts a detached login.mjs --auto, relays its authorize U
     assert.equal(await completeSignIn(url), 200)
     await waitFor(() => readAuth()?.refresh_token === "auto-refresh", { what: "the child to persist the tokens" })
     await waitFor(() => !existsSync(markerPath), { what: "the child to release the marker" })
+})
+
+test("spawnAutoLogin: an unreachable sign-in server — the wait ends the moment the helper gives up (not after the full budget), the automatic sign-in is HELD, --status says until when", async () => {
+    process.env.CIWG_OIDC_ISSUER = DEAD_ISSUER
+    try {
+        const t0 = Date.now()
+        const result = await spawnAutoLogin({ waitMs: 6_000 })
+        const elapsed = Date.now() - t0
+        assert.deepEqual(result, { started: true, url: null, ended: true, failed: true })
+        assert.ok(elapsed < 1_500, `returned after ${elapsed}ms — the child's exit cuts the wait short`)
+        assert.ok(!existsSync(markerPath))
+        const state = readState()
+        assert.equal(state.auto_login_at, undefined, "no link, no tab: the daily cadence is untouched")
+        assert.match(state.auto_login_error, /./)
+        assert.ok(state.auto_login_hold_until > Date.now() + AUTO_LOGIN_HOLD_MS - elapsed - 1_000)
+        assert.ok(state.auto_login_hold_until <= Date.now() + AUTO_LOGIN_HOLD_MS)
+        assert.equal(autoLoginDecision("no-token"), "held")
+        assert.equal(autoLoginDecision("no-token", { now: Date.now() + AUTO_LOGIN_HOLD_MS }), "due", "…until the hold is over")
+        assert.match(describeAuthStatus(), /Automatic sign-in: the last attempt failed \(.+\); it retries after \d{4}-\d{2}-\d{2}T/)
+        assert.doesNotMatch(describeAuthStatus(), /next session start/)
+    } finally {
+        process.env.CIWG_OIDC_ISSUER = issuer
+    }
 })
 
 test("login.mjs --auto: exits without opening anything when signed in, opted out, headless, or when a sibling attempt is live", async () => {
@@ -562,11 +697,44 @@ test("SessionStart hook: a hung sign-in server never holds the hook — it retur
         assert.equal(out.hookSpecificOutput.additionalContext, AUTO_LOGIN_CONTEXT)
         assert.ok(elapsed < 6_000, `hook took ${elapsed}ms`)
         assert.ok(readAutoLoginMarker(), "the child is still trying")
-        assert.equal(readState().auto_login_at, undefined, "no link, no tab: the daily cadence is NOT stamped — the next start may retry")
+        assert.equal(readState().auto_login_at, undefined, "no link, no tab: the daily cadence is NOT stamped")
+        assert.equal(readState().auto_login_hold_until, undefined, "…and nothing is held while it is still trying")
     } finally {
         idpHang = false
         idp.closeAllConnections?.()
+        // The child fails now (its discovery socket was just cut) and writes
+        // its hold — let that land before the next test wipes the state.
+        await waitFor(() => !existsSync(markerPath), { what: "the child to give up" })
     }
+})
+
+test("SessionStart hook: an unreachable sign-in server costs ONE soft \"run /ciwg-login when you're online\" line and returns fast; the automatic sign-in is held and the next starts say nothing at all", async () => {
+    const dead = { CIWG_OIDC_ISSUER: DEAD_ISSUER }
+    const { out, elapsed } = await runHook("session-brief.mjs", startPayload("s-held-1"), dead)
+    assert.ok(out)
+    assert.equal(out.systemMessage, AUTO_LOGIN_MESSAGE_HELD)
+    assert.doesNotMatch(out.systemMessage, /Opening/, "no promise of a browser that is not going to open")
+    assert.equal(out.hookSpecificOutput.additionalContext, AUTO_LOGIN_CONTEXT_HELD)
+    assert.ok(elapsed < 2_500, `hook took ${elapsed}ms — it did not sit out the 2.5 s link wait`)
+    assert.ok(!existsSync(markerPath))
+    const state = readState()
+    assert.equal(state.auto_login_at, undefined)
+    assert.ok(state.auto_login_hold_until > Date.now(), "held")
+    assert.ok(state.first_run_hint_at, "today's nudge is spent with the soft line")
+
+    // On hold: no wait, no line, no child.
+    const second = await runHook("session-brief.mjs", startPayload("s-held-2"), dead)
+    assert.equal(second.out, null)
+    assert.ok(!existsSync(markerPath))
+    assert.equal(readState().auto_login_hold_until, state.auto_login_hold_until, "the hold is not extended by a silent start")
+
+    // The hold over, still unreachable: one soft line again, a new hold —
+    // independent of the daily nudge, which was already spent today.
+    updateState({ auto_login_hold_until: Date.now() - 1 })
+    const third = await runHook("session-brief.mjs", startPayload("s-held-3"), dead)
+    assert.equal(third.out?.systemMessage, AUTO_LOGIN_MESSAGE_HELD)
+    assert.ok(readState().auto_login_hold_until > Date.now())
+    assert.equal(readState().auto_login_at, undefined)
 })
 
 test("SessionStart hook: only a real startup opens a browser — a resumed session gets the one-line hint at most, and stays silent while a sibling's browser is open", async () => {
@@ -638,7 +806,7 @@ test("MCP server: a tool call without a sign-in opens the browser sign-in and an
     const server = startServer()
     try {
         const init = await server.call("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } })
-        assert.equal(init.result.serverInfo.version, "0.3.0", "version comes from plugin.json")
+        assert.equal(init.result.serverInfo.version, "0.3.1", "version comes from plugin.json")
         assert.match(init.result.instructions, /search_company_knowledge/)
         const list = await server.call("tools/list", {})
         assert.deepEqual(list.result.tools.map((t) => t.name), ["search_company_knowledge", "get_source_artifacts"])
@@ -671,6 +839,22 @@ test("MCP server: a tool call without a sign-in opens the browser sign-in and an
         assert.equal(after.result.isError, true)
         assert.match(toolText(after), /unreachable|backing off/)
         assert.doesNotMatch(toolText(after), /browser/)
+    } finally {
+        await server.stop()
+    }
+})
+
+test("MCP server: while the automatic sign-in is held (the sign-in server was unreachable), a tool call gets the manual /ciwg-login line — not \"opened in your browser\" about a tab that never opens", async () => {
+    markAutoLoginFailed("OIDC discovery failed", Date.now())
+    const server = startServer()
+    try {
+        await server.call("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } })
+        const res = await server.call("tools/call", { name: "search_company_knowledge", arguments: { q: "acme" } })
+        assert.equal(res.result.isError, true)
+        assert.match(toolText(res), /\/ciwg-login/)
+        assert.doesNotMatch(toolText(res), /browser/)
+        assert.ok(!existsSync(markerPath))
+        assert.equal(readState().auto_login_at, undefined)
     } finally {
         await server.stop()
     }
