@@ -8,9 +8,10 @@
 #   ciwg-knowledge-desktop-<version>.zip  (Claude Cowork; Desktop/claude.ai
 #                                          chat unverified — see the README)
 #   release.json, SHA256SUMS
-# The synapse "AI Tools" page serves those assets to staff through the
-# web-services proxy (GET /api/v1/knowledge/plugin-package) — the repo is
-# private, so nothing here is a public download link. Bump the version in
+# The repo is public: the assets are plain download links, and the synapse
+# "AI Tools" page points straight at them (web-services looks the release
+# up via GET /api/v1/knowledge/plugin-package/info; its streaming proxy is
+# only for a private repo). Bump the version in
 # plugins/ciwg-knowledge/.claude-plugin/plugin.json to cut a release.
 #
 # Least privilege: the test job runs PR code (npm test executes whatever the
