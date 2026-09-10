@@ -34,8 +34,9 @@ against Anthropic's docs, 2026-09-09 — see "What runs where").
 3. Done. Ask about a client, a meeting or a decision — Claude searches
    company knowledge first and cites `[source]` pointers.
 
-**Claude Desktop chat / claude.ai chat: unverified until a real upload
-test.** Anthropic's docs disagree with each other: the support article
+**Claude Desktop chat / claude.ai chat: unverified — no one has yet seen
+the connector listed there after an upload.** Anthropic's docs disagree
+with each other: the support article
 says a plugin's skills and connectors work in chat, while the Claude
 Desktop plugin docs say "Connectors declared by a plugin you add yourself
 are not added to Claude Desktop's connectors". The first upload through
@@ -323,7 +324,8 @@ the Desktop asset carries the **verify on first upload** note about chat
 only the release job may write). The repo is public, so the synapse AI
 Tools page links straight to those assets (web-services with ci-connect
 #796 or later: `GET /api/v1/knowledge/plugin-package/info` looks the
-release up anonymously and hands the page each asset's download URL —
+release up without a GitHub token and hands the page each asset's
+download URL —
 earlier builds fall back to the Releases link); its streaming proxy
 (`GET /api/v1/knowledge/plugin-package?target=desktop|code`, staff-gated)
 remains for a private repo with a server-side read-only token.
