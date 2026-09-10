@@ -9,7 +9,7 @@
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { after, test } from "node:test"
@@ -36,7 +36,7 @@ after(() => {
 })
 
 const { createZip, readZip, crc32 } = await import("../../../tools/lib/zip.mjs")
-const { buildAll, buildCodePackage, buildDesktopPackage } = await import("../../../tools/package.mjs")
+const { buildAll, buildCodePackage, buildDesktopPackage, DESKTOP_PLUGIN_NAME } = await import("../../../tools/package.mjs")
 const { OIDC_CLIENT_ID } = await import("../scripts/lib/auth.mjs")
 const { API_BASE } = await import("../scripts/lib/config.mjs")
 
@@ -94,9 +94,9 @@ test("zip: a directory record precedes the first file in each directory (portabl
     assert.deepEqual(readZip(createZip(files, { directories: false }), { directories: true }).map((e) => e.name), files.map((f) => f.name))
 })
 
-test("plugin.json: version pinned at 0.3.1 (semver) — users only receive updates when it is bumped", () => {
+test("plugin.json: version pinned at 0.3.2 (semver) — users only receive updates when it is bumped", () => {
     assert.equal(manifest.name, "ciwg-knowledge")
-    assert.equal(manifest.version, "0.3.1")
+    assert.equal(manifest.version, "0.3.2")
     assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
 })
 
@@ -131,6 +131,8 @@ test("Claude Code package: manifest + hooks + local MCP server + skill + command
     // The zipped manifest IS the source manifest — the plugin at the archive root.
     const zipped = JSON.parse(entry(pkg, ".claude-plugin/plugin.json").data.toString())
     assert.deepEqual(zipped, manifest)
+    assert.equal(zipped.name, "ciwg-knowledge", "the Claude Code plugin keeps the source name")
+    assert.equal(pkg.pluginName, "ciwg-knowledge")
     assert.equal(zipped.mcpServers["ciwg-knowledge"].command, "node")
     assert.deepEqual(zipped.mcpServers["ciwg-knowledge"].args, ["${CLAUDE_PLUGIN_ROOT}/scripts/knowledge-mcp.mjs"])
     assert.equal(zipped.hooks, "./hooks/hooks.json")
@@ -158,11 +160,27 @@ test("Claude Desktop package: no hooks, no local server — the remote SSO conne
         "skills/company-knowledge/SKILL.md",
     ])
     const zipped = JSON.parse(entry(pkg, ".claude-plugin/plugin.json").data.toString())
-    assert.equal(zipped.name, "ciwg-knowledge")
+    // Its own plugin. Up to 0.3.1 it was also named "ciwg-knowledge", and
+    // Claude Desktop registers an upload in the registry Claude Code reads —
+    // so on a machine with both, Claude Code reported `ciwg-knowledge@skills-dir:
+    // Not loaded — the name "ciwg-knowledge" is already taken by an installed
+    // plugin (ciwg-knowledge@local-desktop-app-uploads)` and silently lost the
+    // hooks and the automatic sign-in.
+    assert.equal(zipped.name, "ciwg-knowledge-desktop")
+    assert.equal(DESKTOP_PLUGIN_NAME, "ciwg-knowledge-desktop")
+    assert.equal(pkg.pluginName, "ciwg-knowledge-desktop")
+    assert.notEqual(zipped.name, manifest.name, "never the Code plugin's name")
     assert.equal(zipped.version, manifest.version)
+    assert.deepEqual(zipped.author, manifest.author)
+    assert.equal(zipped.homepage, manifest.homepage)
+    assert.equal(zipped.repository, manifest.repository)
     assert.equal(zipped.hooks, undefined, "Desktop chat never runs hooks")
     assert.equal(zipped.mcpServers, undefined, "the connector lives in .mcp.json, declared once")
     assert.match(zipped.description, /CIWG SSO/)
+    assert.match(zipped.description, /Claude Desktop \/ Cowork variant of ciwg-knowledge/)
+    assert.match(zipped.description, /separate plugin from ciwg-knowledge \(Claude Code\)/)
+    // The MCP server key is the connector's name ("CIWG Knowledge"), not the
+    // plugin's — Claude Code namespaces it per plugin, so it cannot collide.
     const mcp = JSON.parse(entry(pkg, ".mcp.json").data.toString())
     assert.deepEqual(mcp, {
         mcpServers: {
@@ -181,7 +199,15 @@ test("Claude Desktop package: no hooks, no local server — the remote SSO conne
     assert.match(readme, new RegExp(`v${manifest.version.replace(/\./g, "\\.")}`))
     // Honest scope: Cowork is documented; chat is unverified and gets the
     // custom-connector route (URL + client id) instead of a promise.
-    assert.match(readme, /Claude Cowork plugin/)
+    assert.match(readme, /Claude Cowork plugin `ciwg-knowledge-desktop`/)
+    assert.match(readme, /installs as the plugin \*\*ciwg-knowledge-desktop\*\*/)
+    // Coexistence with the Code plugin on one machine, spelled out.
+    assert.match(readme, /Also running Claude Code on this machine\?/)
+    assert.match(readme, /a different plugin, \*\*ciwg-knowledge\*\*/)
+    assert.match(readme, /`~\/\.claude\/skills\/ciwg-knowledge`/)
+    assert.match(readme, /side by side, each under its own name/)
+    assert.match(readme, /\*requires authentication\* until you authenticate it there — optional/)
+    assert.match(readme, /skip this upload on that machine and add the custom connector/)
     assert.match(readme, /chat — unverified/)
     assert.match(readme, /Settings → Connectors → Add custom connector/)
     assert.ok(readme.includes(`URL \`${API_BASE}/mcp\``))
@@ -204,16 +230,28 @@ test("Claude Desktop package: no hooks, no local server — the remote SSO conne
     assert.equal(stagingMcp.mcpServers["ciwg-knowledge"].oauth.clientId, "stage-client")
 })
 
+test("Desktop package: refuses a source manifest that already carries the Desktop name — the two zips must stay distinct plugins", async () => {
+    const clash = join(outDir, "clash")
+    mkdirSync(join(clash, ".claude-plugin"), { recursive: true })
+    writeFileSync(join(clash, ".claude-plugin", "plugin.json"), JSON.stringify({ name: DESKTOP_PLUGIN_NAME, version: "9.9.9" }))
+    await assert.rejects(
+        buildDesktopPackage({ pluginDir: clash, mcpUrl: "https://api.stage.test/mcp", clientId: "stage-client" }),
+        /must not share the Code plugin's name/
+    )
+})
+
 test("buildAll: writes both zips, release.json and SHA256SUMS that agree; rebuilding is byte-identical", async () => {
     const release = await buildAll({ outDir })
     assert.equal(release.version, manifest.version)
     assert.deepEqual(
-        release.assets.map((a) => [a.target, a.file]),
+        release.assets.map((a) => [a.target, a.file, a.plugin_name]),
         [
-            ["code", `ciwg-knowledge-${manifest.version}.zip`],
-            ["desktop", `ciwg-knowledge-desktop-${manifest.version}.zip`],
-        ]
+            ["code", `ciwg-knowledge-${manifest.version}.zip`, "ciwg-knowledge"],
+            ["desktop", `ciwg-knowledge-desktop-${manifest.version}.zip`, "ciwg-knowledge-desktop"],
+        ],
+        "each asset names the plugin it installs as — two distinct plugins"
     )
+    assert.equal(release.name, "ciwg-knowledge", "the release / source plugin name")
     const sums = readFileSync(join(outDir, "SHA256SUMS"), "utf8").trim().split("\n")
     assert.equal(sums.length, 2)
     for (const asset of release.assets) {
@@ -221,7 +259,11 @@ test("buildAll: writes both zips, release.json and SHA256SUMS that agree; rebuil
         assert.equal(bytes.length, asset.bytes)
         assert.equal(sha256(bytes), asset.sha256)
         assert.ok(sums.includes(`${asset.sha256}  ${asset.file}`), `SHA256SUMS lists ${asset.file}`)
-        assert.ok(readZip(bytes).length > 0)
+        const zipped = readZip(bytes)
+        assert.ok(zipped.length > 0)
+        // release.json's plugin_name IS the name inside the zip's manifest.
+        const zippedManifest = JSON.parse(zipped.find((e) => e.name === ".claude-plugin/plugin.json").data.toString())
+        assert.equal(zippedManifest.name, asset.plugin_name, `${asset.file}: plugin_name matches the zipped manifest`)
     }
     const onDisk = JSON.parse(readFileSync(join(outDir, "release.json"), "utf8"))
     assert.deepEqual(onDisk, release)

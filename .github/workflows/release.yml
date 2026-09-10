@@ -4,8 +4,9 @@
 # workflow artifact for review). On main, when plugin.json carries a
 # version that has no release yet, a release tagged
 # ciwg-knowledge-v<version> is created with:
-#   ciwg-knowledge-<version>.zip          (Claude Code)
-#   ciwg-knowledge-desktop-<version>.zip  (Claude Cowork; Desktop/claude.ai
+#   ciwg-knowledge-<version>.zip          (plugin ciwg-knowledge: Claude Code)
+#   ciwg-knowledge-desktop-<version>.zip  (plugin ciwg-knowledge-desktop:
+#                                          Claude Cowork; Desktop/claude.ai
 #                                          chat unverified — see the README)
 #   release.json, SHA256SUMS
 # The repo is public: the assets are plain download links, and the synapse
@@ -88,8 +89,8 @@ jobs:
             echo
             echo "Download the package for your Claude from the synapse AI Tools page (staff sign-in) — or here:"
             echo
-            echo "- \`ciwg-knowledge-${VERSION}.zip\` — Claude Code: unzip into ~/.claude/skills/ciwg-knowledge (auto-loads next session; the CIWG sign-in opens once, on session start — or run /ciwg-login). \`claude --plugin-dir <zip>\` / \`claude --plugin-url <zip url>\` load it for one session."
-            echo "- \`ciwg-knowledge-desktop-${VERSION}.zip\` — Claude Cowork: Customize → Plugins → Upload plugin, then Connect (CIWG SSO). Claude Desktop / claude.ai CHAT: unverified until a real upload test — for chat, add the connector by hand instead: Settings → Connectors → Add custom connector → https://api.ciwebgroup.com/mcp (OAuth client id in the README)."
+            echo "- \`ciwg-knowledge-${VERSION}.zip\` — plugin \`ciwg-knowledge\`, Claude Code: unzip into ~/.claude/skills/ciwg-knowledge (auto-loads next session; the CIWG sign-in opens once, on session start — or run /ciwg-login). \`claude --plugin-dir <zip>\` / \`claude --plugin-url <zip url>\` load it for one session."
+            echo "- \`ciwg-knowledge-desktop-${VERSION}.zip\` — plugin \`ciwg-knowledge-desktop\`, Claude Cowork: Customize → Plugins → Upload plugin, then Connect (CIWG SSO). A separate plugin from the Claude Code one, so both load side by side on a machine that runs both (up to 0.3.1 they shared the name and the upload shadowed the Code plugin in Claude Code — see the README's troubleshooting entry). Claude Desktop / claude.ai CHAT: unverified until a real upload test — for chat, add the connector by hand instead: Settings → Connectors → Add custom connector → https://api.ciwebgroup.com/mcp (OAuth client id in the README)."
             echo
             echo "Checksums in SHA256SUMS (built on Node 22 — a rebuild on another Node major can differ, see the README)."
           } > notes.md

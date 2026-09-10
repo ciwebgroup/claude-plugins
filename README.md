@@ -11,7 +11,7 @@ knowledge request is checked against Authentik membership on the server.
 
 | Plugin | What it does | Get it |
 |---|---|---|
-| `ciwg-knowledge` | Company knowledge in Claude: auto-injected into Claude Code via hooks (zero retrieval tokens); a remote connector + skill for Claude Cowork (plugin upload) and for claude.ai / Claude Desktop chat (as a custom connector — whether the plugin upload itself works in chat is unverified, see the plugin README). Sign in once with CIWG SSO — no tokens, no env vars. | `ciwg-knowledge-<version>.zip` (Claude Code) / `ciwg-knowledge-desktop-<version>.zip` (Cowork) from [Releases](https://github.com/ciwebgroup/claude-plugins/releases) or the AI Tools page |
+| `ciwg-knowledge` | Company knowledge in Claude: auto-injected into Claude Code via hooks (zero retrieval tokens); a remote connector + skill for Claude Cowork (plugin upload) and for claude.ai / Claude Desktop chat (as a custom connector — whether the plugin upload itself works in chat is unverified, see the plugin README). Sign in once with CIWG SSO — no tokens, no env vars. | `ciwg-knowledge-<version>.zip` (Claude Code — installs as plugin `ciwg-knowledge`) / `ciwg-knowledge-desktop-<version>.zip` (Cowork — installs as plugin `ciwg-knowledge-desktop`; distinct names, so both coexist on one machine) from [Releases](https://github.com/ciwebgroup/claude-plugins/releases) or the AI Tools page |
 
 Each plugin's README has the three-step install for each surface and the
 admin notes.
