@@ -26,10 +26,10 @@
 
 import { join } from "node:path"
 import { clearApiRejected, markApiRejected, resolveAuth } from "./auth.mjs"
-import { ciwgDir, debug, escapeXml, fetchWithTimeout, readJson, remainingMs } from "./paths.mjs"
+import { ciwgDir, debug, escapeXml, fetchWithTimeout, pluginVersion, readJson, remainingMs } from "./paths.mjs"
 import { backOff, isBackedOff } from "./state.mjs"
 
-export { debug, escapeXml }
+export { debug, escapeXml, pluginVersion }
 
 export const API_BASE = (
     process.env.CIWG_KNOWLEDGE_URL || "https://api.ciwebgroup.com"
@@ -273,7 +273,13 @@ export async function postInject(request, opts = {}) {
         {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(request),
+            // Stamp every call with this build: the server logs it, so
+            // "injection is not working for me" is answerable from the
+            // data instead of guesswork about which version is installed.
+            body: JSON.stringify({
+                ...request,
+                client: { name: "ciwg-knowledge", version: pluginVersion() },
+            }),
         },
         opts
     )

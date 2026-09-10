@@ -132,3 +132,25 @@ export async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
  * when no deadline was given. Negative once it has passed. */
 export const remainingMs = (deadline, now = Date.now()) =>
     Number.isFinite(deadline) ? deadline - now : Infinity
+
+/**
+ * This plugin's own version, from the manifest — the single source, so a
+ * hook, the MCP server and the API client can never disagree. Sent with
+ * every server call: without it, "injection is not working for me" cannot
+ * be answered from the server side (see the 2026-09-10 tester report).
+ * Memoised; "0.0.0" if the manifest is unreadable.
+ */
+let cachedVersion
+export function pluginVersion() {
+    if (cachedVersion === undefined) {
+        try {
+            const manifest = JSON.parse(
+                stripBom(readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"))
+            )
+            cachedVersion = typeof manifest.version === "string" ? manifest.version : "0.0.0"
+        } catch {
+            cachedVersion = "0.0.0"
+        }
+    }
+    return cachedVersion
+}

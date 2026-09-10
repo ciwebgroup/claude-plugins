@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { after, before, beforeEach, test } from "node:test"
@@ -218,6 +218,15 @@ test("API calls fail open with no token — no network attempted", async () => {
     assert.deepEqual(list, { ok: false, status: "no-token" })
     const inject = await postInject({ event: "prompt", prompt: "what did Acme decide?", facts: { repo: "acme-hvac" } })
     assert.deepEqual(inject, { ok: false, status: "no-token" })
+})
+
+test("pluginVersion: the manifest's version, matching what the MCP server reports", async () => {
+    const { pluginVersion } = await import("../scripts/lib/paths.mjs")
+    const manifest = JSON.parse(
+        readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8")
+    )
+    assert.equal(pluginVersion(), manifest.version)
+    assert.match(pluginVersion(), /^\d+\.\d+\.\d+$/)
 })
 
 test("listEngramActivities refuses an unscoped read", async () => {

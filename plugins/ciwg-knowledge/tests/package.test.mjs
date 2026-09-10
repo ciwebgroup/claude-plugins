@@ -94,9 +94,9 @@ test("zip: a directory record precedes the first file in each directory (portabl
     assert.deepEqual(readZip(createZip(files, { directories: false }), { directories: true }).map((e) => e.name), files.map((f) => f.name))
 })
 
-test("plugin.json: version pinned at 0.3.8 (semver) — users only receive updates when it is bumped", () => {
+test("plugin.json: version pinned at 0.3.9 (semver) — users only receive updates when it is bumped", () => {
     assert.equal(manifest.name, "ciwg-knowledge")
-    assert.equal(manifest.version, "0.3.8")
+    assert.equal(manifest.version, "0.3.9")
     assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
 })
 
