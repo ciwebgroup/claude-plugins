@@ -94,9 +94,9 @@ test("zip: a directory record precedes the first file in each directory (portabl
     assert.deepEqual(readZip(createZip(files, { directories: false }), { directories: true }).map((e) => e.name), files.map((f) => f.name))
 })
 
-test("plugin.json: version pinned at 0.3.4 (semver) — users only receive updates when it is bumped", () => {
+test("plugin.json: version pinned at 0.3.5 (semver) — users only receive updates when it is bumped", () => {
     assert.equal(manifest.name, "ciwg-knowledge")
-    assert.equal(manifest.version, "0.3.4")
+    assert.equal(manifest.version, "0.3.5")
     assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
 })
 
@@ -115,6 +115,7 @@ test("Claude Code package: manifest + hooks + local MCP server + skill + command
         "scripts/inject-context.mjs",
         "scripts/engram-post.mjs",
         "scripts/engram-turn.mjs",
+        "scripts/self-update.mjs",
         "scripts/login.mjs",
         "scripts/logout.mjs",
         "scripts/lib/auth.mjs",
@@ -123,6 +124,7 @@ test("Claude Code package: manifest + hooks + local MCP server + skill + command
         "scripts/lib/paths.mjs",
         "scripts/lib/state.mjs",
         "scripts/lib/transcript.mjs",
+        "scripts/lib/update.mjs",
         "README.md",
     ]) {
         assert.ok(list.includes(required), `missing ${required}`)

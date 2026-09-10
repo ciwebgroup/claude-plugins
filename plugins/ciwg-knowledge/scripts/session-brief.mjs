@@ -66,6 +66,12 @@ import {
 } from "./lib/config.mjs"
 import { detectRepoName } from "./lib/engram.mjs"
 import { remainingMs } from "./lib/paths.mjs"
+import { readState, updateState } from "./lib/state.mjs"
+import { spawn } from "node:child_process"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+
+const scriptsDir = dirname(fileURLToPath(import.meta.url))
 
 const PROACTIVE_REFRESH_MS = 5 * 60_000
 /** Kept back after the auto-login wait for the stdout flush. */
@@ -125,11 +131,36 @@ async function handleNoCredential(status, sessionId, source, deadline) {
     process.exit(0)
 }
 
+/**
+ * Once a day, check for a newer release in the background (detached, off
+ * the hook budget) and install it in place for the NEXT session — so a
+ * tester installs once. The stamp is written before the spawn so two
+ * sessions starting together do not both check.
+ */
+function maybeSpawnSelfUpdate() {
+    if ((process.env.CIWG_AUTO_UPDATE ?? "").toLowerCase() === "off") return
+    const last = readState().auto_update_checked_at
+    if (Number.isFinite(last) && Date.now() - last < 24 * 60 * 60_000) return
+    updateState({ auto_update_checked_at: Date.now() })
+    try {
+        const child = spawn(process.execPath, [join(scriptsDir, "self-update.mjs")], {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+            env: process.env,
+        })
+        child.unref()
+    } catch (error) {
+        debug("auto-update spawn failed:", error?.message)
+    }
+}
+
 try {
     const payload = JSON.parse(await readStdin())
     if (payload.source === "compact" || payload.source === "clear") {
         process.exit(0)
     }
+    if (payload.source === "startup") maybeSpawnSelfUpdate()
     const deadline = hookDeadline()
 
     // Resolves the credential once (a silent — possibly proactive — refresh

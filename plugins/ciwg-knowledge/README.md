@@ -97,8 +97,11 @@ everyone too (updates arrive with `/plugin update`):
 /plugin install ciwg-knowledge@ciwg
 ```
 
-Updating a zip install: unzip the new version over the same folder (the
-plugin's own `version` in `plugin.json` is what Claude Code reads).
+**Updates are automatic.** Once a day, at session start, the plugin checks
+the latest release in the background, verifies its checksum and replaces
+its own files in place; the next session runs the new version — install
+once, however you installed it. `CIWG_AUTO_UPDATE=off` disables it (then
+unzip the new version over the same folder yourself).
 
 ## What you'll see
 
