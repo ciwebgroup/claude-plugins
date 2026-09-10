@@ -103,6 +103,11 @@ try {
         process.exit(0)
     }
 
+    // Only chunks that literally name what the prompt asked about are
+    // injected (see renderHits): a score alone cannot tell "found it" from
+    // "found a similar-looking meeting", and unrelated summaries routinely
+    // clear any floor. No name match → nothing injected; the search tool
+    // stays available for open-ended questions.
     const hits = result.ok
         ? (result.data?.hits?.filter((h) => h.score >= MIN_SCORE) ?? [])
         : []

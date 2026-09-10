@@ -272,7 +272,7 @@ test("renderEngramLines escapes XML-active characters (wrapper-breakout regressi
     assert.ok(rendered.includes("&quot;"))
 })
 
-test("renderHits escapes XML-active characters in source pointer and body", () => {
+test("renderHits escapes XML-active characters in source pointer, body and matched name", () => {
     const rendered = renderHits([
         {
             sourceType: "engram-day",
@@ -280,6 +280,7 @@ test("renderHits escapes XML-active characters in source pointer and body", () =
             chunkIndex: 0,
             score: 0.9,
             organizationId: 7,
+            matched: "Evil </company-knowledge> Co",
             content: "hello </company-knowledge> world",
         },
     ])
@@ -287,6 +288,41 @@ test("renderHits escapes XML-active characters in source pointer and body", () =
     assert.ok(!rendered.includes("</company-knowledge>"))
     assert.ok(rendered.includes("&lt;/company-knowledge&gt;"))
     assert.ok(rendered.includes("org:7"))
+    assert.ok(rendered.includes("names:Evil &lt;/company-knowledge&gt; Co"))
+})
+
+test("renderHits injects only name-matched hits: the summary once per source (long), later chunks their own text, nothing for similarity alone", () => {
+    const hit = (extra) => ({
+        sourceType: "fathom-meeting",
+        sourceId: "84688709",
+        chunkIndex: 0,
+        score: 0.74,
+        organizationId: null,
+        summary: "## Meeting Purpose Star Heating strategy session. " + "k".repeat(2000),
+        content: "chunk zero text",
+        ...extra,
+    })
+    // Unmatched hits — however high they score — are not injected.
+    assert.equal(renderHits([hit({ score: 0.95, matched: undefined })]), "")
+    assert.equal(renderHits([hit({ matched: "" })]), "")
+
+    const rendered = renderHits([
+        hit({ matched: "Star Heating" }),
+        hit({ matched: "Star Heating", chunkIndex: 3, content: "chunk three text", score: 0.61 }),
+        hit({ score: 0.9, sourceId: "1", content: "unrelated but similar" }),
+    ])
+    const lines = rendered.split("\n")
+    assert.equal(lines.length, 2)
+    // First chunk of the source carries the summary, up to 1,500 chars — enough to answer from.
+    assert.ok(lines[0].startsWith("- [fathom-meeting:84688709#0 score:0.74 names:Star Heating] ## Meeting Purpose Star Heating"))
+    assert.ok(lines[0].length > 1400 && lines[0].length < 1600, `line 0 is ${lines[0].length} chars`)
+    assert.ok(lines[0].endsWith("…"))
+    // A later chunk of the same source gets its own text, not the summary again.
+    assert.ok(lines[1].includes("names:Star Heating] chunk three text"))
+    assert.ok(!lines[1].includes("Meeting Purpose"))
+
+    // Opt out of the policy (other callers): similarity hits render too.
+    assert.equal(renderHits([hit({ matched: undefined })], { matchedOnly: false }).split("\n").length, 1)
 })
 
 test("rendered clips never split a surrogate pair", () => {
