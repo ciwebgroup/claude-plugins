@@ -22,13 +22,22 @@ Get the zip for your Claude from the synapse **AI Tools** page (staff
 sign-in) — it links to the latest release — or from this repo's
 [Releases](https://github.com/ciwebgroup/claude-plugins/releases).
 
+The two zips are two **plugins** — `ciwg-knowledge` (the Claude Code zip)
+and `ciwg-knowledge-desktop` (the Cowork upload) — so they coexist on a
+machine that runs both; see "What runs where".
+
 ### Claude Cowork → `ciwg-knowledge-desktop-<version>.zip`
 
 Cowork runs an uploaded plugin's skills, connectors and hooks (verified
 against Anthropic's docs, 2026-09-09 — see "What runs where").
 
 1. In Claude Desktop open **Customize → Plugins → Add plugin → Upload
-   plugin** and choose the zip (Claude accepts `.zip` only).
+   plugin** and choose the zip (Claude accepts `.zip` only). It installs
+   as the plugin `ciwg-knowledge-desktop`. **Upgrading from 0.3.1 or
+   earlier?** Remove the old `ciwg-knowledge` plugin first (Customize →
+   Plugins, or `claude plugin uninstall ciwg-knowledge@local-desktop-app-uploads`)
+   — the name changed, so this upload adds a plugin rather than replacing
+   the old one.
 2. Open the installed plugin, find the **CIWG Knowledge** connector and
    click **Connect**. Sign in with CIWG SSO and approve access.
 3. Done. Ask about a client, a meeting or a decision — Claude searches
@@ -64,7 +73,8 @@ release ticket so this section — and the note in `release.json` — can go).
 Needs Node.js ≥ 18 on your `PATH` (the hooks and the local server run with
 `node`; nothing to `npm install`).
 
-1. Unzip into your personal skills folder — it auto-loads, no install step:
+1. Unzip into your personal skills folder — it auto-loads, no install step
+   (as the plugin `ciwg-knowledge`, listed `ciwg-knowledge@skills-dir`):
    - macOS / Linux: `unzip -o ~/Downloads/ciwg-knowledge-<version>.zip -d ~/.claude/skills/ciwg-knowledge`
    - Windows (PowerShell): `Expand-Archive -Force "$HOME\Downloads\ciwg-knowledge-<version>.zip" "$HOME\.claude\skills\ciwg-knowledge"`
 2. Start (or restart) Claude Code. The first session opens the CIWG SSO
@@ -133,6 +143,27 @@ a single wrapping folder tolerated). Claude Code's `claude plugin install`
 takes marketplace names only; a local zip loads via `--plugin-dir`, a
 remote one via `--plugin-url`, or it auto-loads from under
 `~/.claude/skills/` ([Plugins reference](https://code.claude.com/docs/en/plugins-reference)).
+
+**Two plugins, not one.** The Code zip installs as `ciwg-knowledge`, the
+Desktop zip as `ciwg-knowledge-desktop` (its connector is still named
+**CIWG Knowledge**; the `.mcp.json` server key stays `ciwg-knowledge`,
+which Claude Code namespaces per plugin —
+`plugin:ciwg-knowledge-desktop:ciwg-knowledge`). Claude Desktop stores an
+uploaded plugin under
+`~/.claude/plugins/marketplaces/local-desktop-app-uploads/<name>` and
+registers it in the same installed-plugins registry Claude Code reads, and
+an installed plugin takes precedence over a same-named one under
+`~/.claude/skills`. Up to 0.3.1 both zips were named `ciwg-knowledge`, so
+on a machine with the Code zip unzipped AND the Desktop zip uploaded,
+Claude Code silently swapped the Code plugin for the hook-less Desktop
+one — no auto-injection, no automatic sign-in (Troubleshooting, below).
+Since 0.3.2 the names differ and both load side by side — the
+`company-knowledge` skill and the CIWG Knowledge connector each appear
+twice in Claude Code, once per plugin: Claude Code lists the Desktop
+plugin's connector as *requires authentication* until you authenticate it
+with `/mcp` — optional there, the Code plugin already injects the same
+knowledge. Prefer no duplicate? Skip the Desktop upload on that machine
+and use the custom connector in Desktop (Install, above).
 
 ## What you get (Claude Code)
 
@@ -249,6 +280,17 @@ should remove it (the automatic sign-in never runs while one is set).
   adds stderr traces. If the automatic sign-in cannot bind a local port or
   open a browser, `/ciwg-login` prints the link; from a normal terminal,
   `node <plugin-root>/scripts/login.mjs` is the same thing.
+- **Claude Code says `ciwg-knowledge@skills-dir: ✘ Not loaded — the name
+  "ciwg-knowledge" is already taken by an installed plugin
+  (ciwg-knowledge@local-desktop-app-uploads), which takes precedence`** —
+  a pre-0.3.2 Desktop zip was uploaded into Claude Desktop on this
+  machine; it registered under the same name and shadows the Code plugin
+  (no hooks, no automatic sign-in). Remove that upload — in Claude
+  Desktop, Customize → Plugins → the `ciwg-knowledge` plugin → remove; or
+  `claude plugin uninstall ciwg-knowledge@local-desktop-app-uploads` —
+  restart Claude Code, then — if you want the Desktop variant — re-upload
+  the 0.3.2 Desktop zip; it installs as `ciwg-knowledge-desktop` and the
+  two coexist ("What runs where").
 
 ## Engram — shared daily working memory
 
@@ -315,7 +357,9 @@ line can legitimately differ; the published digests are CI's (Node 22 —
 compare local builds on Node 22 only; `release.json` records
 `built_with.node`). The zips carry directory records, so extractors that
 need them (Windows' built-in one, Java-based tools) create the folders.
-`release.json` also lists the surfaces each asset is documented for, and
+`release.json` also names each asset's plugin (`plugin_name`:
+`ciwg-knowledge` / `ciwg-knowledge-desktop`), lists the surfaces each
+asset is documented for, and
 the Desktop asset carries the **verify on first upload** note about chat
 (see "What runs where"). Pushing to `main` with a new `version` in
 `.claude-plugin/plugin.json` creates the GitHub Release
@@ -349,8 +393,10 @@ remains for a private repo with a server-side read-only token.
   silent afterwards), the MCP server as a real process (friendly message
   in ~2 s, then works after the sign-in), the tool-call cooldown schedule.
 - `package.test.mjs` — both zips have the structure each surface expects
-  (directory records included), metadata files agree and carry the
-  verify-on-first-upload note, rebuilds are byte-identical, the CLI works.
+  (directory records included) and are distinct plugins (`ciwg-knowledge`
+  / `ciwg-knowledge-desktop`, guard included), metadata files agree, name
+  each asset's plugin and carry the verify-on-first-upload note, rebuilds
+  are byte-identical, the CLI works.
 
 No network is touched — every call goes to a `127.0.0.1` server the test
 owns — no real browser is launched, and `~/.ciwg` is redirected to a temp
