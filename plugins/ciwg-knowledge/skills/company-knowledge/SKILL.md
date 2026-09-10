@@ -14,6 +14,15 @@ answer from memory whenever the user asks about:
 - a ticket, a chat thread, a past decision, or a commitment we made
 - what a teammate worked on recently (engram daily activity)
 
+## Already in your context?
+
+A `<company-knowledge auto-retrieved="true">` block in the prompt is the
+hook's answer to this same question: it carries the best-matching source's
+whole summary plus pointers. **Answer from it.** If you need more than the
+summary (the transcript, action items), call `get_source_artifacts` on the
+pointer it named — do not re-run `search_company_knowledge` for the same
+question. Search only when nothing was injected or the question moved on.
+
 ## How
 
 1. Call `search_company_knowledge` with the user's question as `q` (add
