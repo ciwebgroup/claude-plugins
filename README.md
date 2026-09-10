@@ -1,8 +1,11 @@
 # CIWG Claude plugins
 
-Private plugin repository for CI Web Group's internal Claude tooling.
-Each release ships downloadable zips (no marketplace, no git access
-needed) — staff get them from the synapse **AI Tools** page.
+CI Web Group's Claude plugins. The repository is public so that each
+release's zips are plain download links — the synapse **AI Tools** page
+points staff straight at them (no marketplace, no GitHub account). The
+plugins themselves are inert without a CIWG SSO sign-in: the only
+credential-shaped value in here is the public OAuth client id, and every
+knowledge request is checked against Authentik membership on the server.
 
 ## Plugins
 
@@ -24,7 +27,7 @@ Digests are reproducible on the same Node major only (zlib differs between
 Node lines); CI builds on Node 22. A local zip loads for one session with
 `claude --plugin-dir <zip>` or `claude --plugin-url <zip url>`.
 
-Marketplace install (needs GitHub access to this private repo):
+Marketplace install (works for anyone — the repo is public):
 
 ```
 /plugin marketplace add ciwebgroup/claude-plugins
