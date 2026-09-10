@@ -10,10 +10,15 @@
  *     once a day, and ONLY on a real session startup (payload source
  *     "startup" — a resume, compact or clear never opens anything); never
  *     on SSH/headless/CI or when opted out — those get the old one-line
- *     "/ciwg-login" nudge (once a day / once per session). Automation
- *     that starts sessions (`claude -p`, cron) also reports "startup":
- *     it must set CIWG_AUTO_LOGIN=off (README) — there is no payload
- *     field that tells an unattended run from a person at a terminal;
+ *     "/ciwg-login" nudge (once a day / once per session). When the helper
+ *     gives up before it has a link (the sign-in server is unreachable)
+ *     the wait ends at once, the user gets ONE soft "run /ciwg-login when
+ *     you're online" line, and the automatic sign-in is held for a while
+ *     (lib/auth.mjs AUTO_LOGIN_HOLD_MS) — later starts stay silent.
+ *     Automation that starts sessions (`claude -p`, cron) also reports
+ *     "startup": it must set CIWG_AUTO_LOGIN=off (README) — there is no
+ *     payload field that tells an unattended run from a person at a
+ *     terminal;
  *   - the API rejected the SSO token (401) → an actionable line, once per
  *     session (the server may not trust this app yet).
  *
@@ -37,7 +42,9 @@
 
 import {
     AUTO_LOGIN_CONTEXT,
+    AUTO_LOGIN_CONTEXT_HELD,
     AUTO_LOGIN_MESSAGE,
+    AUTO_LOGIN_MESSAGE_HELD,
     AUTO_LOGIN_MESSAGE_NO_URL,
     autoLoginDecision,
     signInHint,
@@ -87,14 +94,27 @@ async function handleNoCredential(status, sessionId, source, deadline) {
     debug("no usable credential:", status, "— auto-login:", decision)
     if (decision === "due") {
         const waitMs = Math.max(0, Math.min(2_500, remainingMs(deadline) - AUTO_LOGIN_RESERVE_MS))
-        const { started, url } = await spawnAutoLogin({ waitMs })
-        if (started) {
+        const { started, url, ended, failed } = await spawnAutoLogin({ waitMs })
+        if (started && url) {
+            await hint(AUTO_LOGIN_CONTEXT, `${AUTO_LOGIN_MESSAGE} If it did not open, visit:\n${url}`)
+        }
+        if (started && !ended) {
             // No link yet = the helper had not reached the sign-in server
             // when we had to answer: promise nothing, name the manual path.
-            const message = url
-                ? `${AUTO_LOGIN_MESSAGE} If it did not open, visit:\n${url}`
-                : AUTO_LOGIN_MESSAGE_NO_URL
-            await hint(AUTO_LOGIN_CONTEXT, message)
+            await hint(AUTO_LOGIN_CONTEXT, AUTO_LOGIN_MESSAGE_NO_URL)
+        }
+        if (started && failed) {
+            // The helper gave up before it had a link (sign-in server
+            // unreachable) and has put the automatic sign-in on hold: one
+            // soft line now, and today's nudge is spent with it so the next
+            // start — still on hold — says nothing at all.
+            signInHint(status, sessionId)
+            await hint(AUTO_LOGIN_CONTEXT_HELD, AUTO_LOGIN_MESSAGE_HELD)
+        }
+        if (started) {
+            // Gone without a link or a failure: it found nothing to do (a
+            // sign-in or a sibling's attempt landed meanwhile) — silence.
+            process.exit(0)
         }
     } else if (decision === "in-progress") {
         // The browser is already open from an earlier session — say nothing.

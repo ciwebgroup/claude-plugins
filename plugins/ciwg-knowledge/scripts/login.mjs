@@ -80,25 +80,29 @@ async function deferredDeviceStart() {
  * never open a browser; a live sibling attempt (marker) is not duplicated.
  * The daily cadence is stamped HERE, the moment the authorize URL exists
  * and just before the browser opens — not by the spawner: a child that
- * never reaches the sign-in server leaves the cadence alone, so the next
- * session start may try again instead of waiting a day (the spawner's
- * own "in-progress" check on the marker is what stops a second tab).
+ * never reaches the sign-in server leaves the cadence alone and instead
+ * puts the automatic sign-in on a shorter hold (markAutoLoginFailed
+ * without a link), so an unreachable IdP does not cost every session
+ * start a doomed attempt (the spawner's own "in-progress" check on the
+ * marker is what stops a second tab).
  */
 async function autoLogin() {
     if (getLegacyToken() || readAuth()) return
     if (isAutoLoginOptedOut() || looksHeadless()) return
     if (!claimAutoLogin()) return
+    let hadUrl = false
     try {
         await loginWithBrowser({
             timeoutMs: AUTO_LOGIN_TIMEOUT_MS,
             log: debug,
             onAuthorizeUrl: (url) => {
+                hadUrl = true
                 markAutoLoginStarted()
                 publishAutoLoginUrl(url)
             },
         })
     } catch (error) {
-        markAutoLoginFailed(error?.message ?? error)
+        markAutoLoginFailed(error?.message ?? error, Date.now(), { hadUrl })
     } finally {
         releaseAutoLogin()
     }

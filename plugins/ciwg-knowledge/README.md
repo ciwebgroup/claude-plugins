@@ -169,10 +169,15 @@ node:crypto + node:http + fetch (no dependencies).
   and picks up the credential when it lands, never a second tab. A link
   from the marker is relayed only if it is https or loopback-http. Cadence:
   once a day per machine (`~/.ciwg/state.json` `auto_login_at`), stamped
-  the moment the link exists — just before the tab opens — so an attempt
-  that never reached the sign-in server (no link, no tab) may be retried
-  at the next start instead of waiting a day; a sign-out holds it for a
-  day too. Never on SSH/headless/CI. Opt out with `CIWG_AUTO_LOGIN=off`
+  the moment the link exists — just before the tab opens; a sign-out holds
+  it for a day too. An attempt that never reached the sign-in server (no
+  link, no tab — you are offline, the IdP is down) does not spend the day:
+  the hook's wait ends the moment the helper gives up, you see one soft
+  *run /ciwg-login when you're online* line, and the automatic sign-in is
+  held for 30 minutes (`auto_login_hold_until`; the refresh path's
+  `idp_down_until` backoff is honoured too) — later starts, and MCP tool
+  calls, fall back to the manual line until the hold is over. Never on
+  SSH/headless/CI. Opt out with `CIWG_AUTO_LOGIN=off`
   (do this for automation: `claude -p`, cron, anything unattended — those
   report `startup` like a terminal does) or `"autoLogin": false` in
   `~/.ciwg/knowledge.json` — then the old one-line "run /ciwg-login" nudge

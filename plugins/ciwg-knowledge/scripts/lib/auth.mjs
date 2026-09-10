@@ -151,6 +151,13 @@ export const AUTO_LOGIN_MESSAGE = "Opening CIWG sign-in in your browser to conne
  * the hook had to answer — so there is no link to show and no promise that
  * a tab WILL open: name the manual path in the same breath. */
 export const AUTO_LOGIN_MESSAGE_NO_URL = `${AUTO_LOGIN_MESSAGE} — or run /ciwg-login if nothing opens.`
+/** The helper gave up BEFORE it had a link (the sign-in server could not
+ * be reached): nothing opened, and the automatic attempt is now on hold —
+ * said once, softly, when the hold starts; later starts stay silent. */
+export const AUTO_LOGIN_MESSAGE_HELD =
+    "Could not reach CIWG sign-in to connect company knowledge — run /ciwg-login when you're online."
+export const AUTO_LOGIN_CONTEXT_HELD =
+    "ciwg-knowledge: company knowledge is not connected — the CIWG sign-in server could not be reached just now, so the automatic sign-in is paused for a while. If the user asks, tell them to run /ciwg-login once they are online."
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -1187,20 +1194,27 @@ export async function logout({ fetchImpl = globalThis.fetch, timeoutMs = LOGIN_H
  *
  * Cadence: once per day per machine (state.auto_login_at — stamped the
  * moment the authorize URL exists, i.e. just before the browser opens, so
- * a crash after that point cannot re-open it next session, while an
- * attempt that never reached the sign-in server may be retried at the
- * next start); a running attempt (auto-login.json, pid-checked) is never
- * duplicated — a process that loses the claim FOLLOWS the winner instead
- * of opening a second tab; headless sessions, an opt-out
- * (CIWG_AUTO_LOGIN=off / "autoLogin": false in knowledge.json), CI and
- * anything but a real session startup (resume, compact, clear) never
- * auto-open anything — they get the old one-line /ciwg-login hint
- * instead. /ciwg-login stays the manual path.
+ * a crash after that point cannot re-open it next session); an attempt
+ * that never reached the sign-in server (no link, no tab — the IdP is
+ * unreachable, discovery failed, the helper could not start) puts the
+ * automatic sign-in on a shorter HOLD (state.auto_login_hold_until,
+ * AUTO_LOGIN_HOLD_MS) instead of costing every session start a wait and an
+ * "opening your browser" line that opens nothing; a running attempt
+ * (auto-login.json, pid-checked) is never duplicated — a process that
+ * loses the claim FOLLOWS the winner instead of opening a second tab;
+ * headless sessions, an opt-out (CIWG_AUTO_LOGIN=off / "autoLogin": false
+ * in knowledge.json), CI and anything but a real session startup (resume,
+ * compact, clear) never auto-open anything — they get the old one-line
+ * /ciwg-login hint instead. /ciwg-login stays the manual path.
  */
 
 const AUTO_LOGIN_VERSION = 1
 /** At most one automatic browser sign-in per machine per day. */
 const AUTO_LOGIN_EVERY_MS = 24 * 60 * 60_000
+/** After an attempt that never got a link, wait this long before the next
+ * automatic one (a session start while the IdP is unreachable must not
+ * pay for a doomed attempt every time). */
+export const AUTO_LOGIN_HOLD_MS = 30 * 60_000
 /** The loopback flow gives up after 3 minutes; a marker older than this is
  * a crashed attempt whatever its pid says. */
 const AUTO_LOGIN_STALE_MS = 5 * 60_000
@@ -1308,6 +1322,35 @@ function markerBeingWritten(now) {
     }
 }
 
+/** A sibling attempt is LIVE: its marker reads as such, or is being
+ * written right now (a torn read within the grace) — the one test every
+ * process that yields to a sibling applies, so a follower never gives up
+ * on a half-written marker that a moment later names the winner. */
+const siblingIsLive = (now) => Boolean(readAutoLoginMarker({ now }) || markerBeingWritten(now))
+
+/**
+ * EEXIST from the O_EXCL create names a marker worth inspecting only when
+ * ~/.ciwg is a directory and nothing but a regular file (or nothing at
+ * all) sits at the marker path. A FILE at ~/.ciwg — mkdir reports EEXIST
+ * for that too — or a directory at the marker path is a place nobody can
+ * claim on: "unwritable", not a sibling to wait for. A stat that fails
+ * says nothing either way (a race with a sibling's cleanup) and leaves
+ * the marker inspection to decide.
+ */
+function markerPathUsable() {
+    const kind = (path) => {
+        try {
+            return statSync(path)
+        } catch {
+            return null
+        }
+    }
+    const dir = kind(ciwgDir())
+    if (dir && !dir.isDirectory()) return false
+    const marker = kind(autoLoginPath())
+    return !marker || marker.isFile()
+}
+
 /**
  * Create the marker EXCLUSIVELY (O_EXCL). "owned": this process runs the
  * attempt. "sibling": a LIVE attempt exists — a sibling's marker (pid
@@ -1327,11 +1370,11 @@ export function tryClaimAutoLogin({ now = Date.now() } = {}) {
             })
             return "owned"
         } catch (error) {
-            if (error.code !== "EEXIST") {
+            if (error.code !== "EEXIST" || !markerPathUsable()) {
                 debug("auto-login marker unwritable:", error.code || error.message)
                 return "unwritable"
             }
-            if (readAutoLoginMarker({ now }) || markerBeingWritten(now)) return "sibling"
+            if (siblingIsLive(now)) return "sibling"
             rmQuiet(autoLoginPath())
         }
     }
@@ -1358,11 +1401,33 @@ export function releaseAutoLogin() {
     if (marker && marker.pid === process.pid) rmQuiet(autoLoginPath())
 }
 
+/** A tab opened (or the user signed out) within the last day. */
+const autoLoginRanRecently = (state, now) =>
+    Number.isFinite(state.auto_login_at) && now - state.auto_login_at < AUTO_LOGIN_EVERY_MS
+
+/**
+ * When the automatic sign-in may next start, or null when nothing holds
+ * it: the daily cadence after a tab opened (or a sign-out), the hold after
+ * an attempt that never got a link, or the refresh path's own IdP backoff
+ * (idp_down_until: the sign-in server was unreachable moments ago — an
+ * attempt now would only fail the same way).
+ */
+function autoLoginHeldUntil(state, now) {
+    const until = Math.max(
+        autoLoginRanRecently(state, now) ? state.auto_login_at + AUTO_LOGIN_EVERY_MS : 0,
+        Number.isFinite(state.auto_login_hold_until) ? state.auto_login_hold_until : 0,
+        Number.isFinite(state.idp_down_until) ? state.idp_down_until : 0
+    )
+    return until > now ? until : null
+}
+
 /**
  * Should an automatic sign-in start now for a failed credential status?
  *   "due"            → start one
  *   "in-progress"    → one is running (browser already open) — say nothing new
  *   "recent"         → one ran within the last day — fall back to the hint
+ *   "held"           → the last one never got a link (sign-in server
+ *                      unreachable) — on hold, fall back to the hint
  *   "opted-out" / "headless" / "not-applicable" → never auto-open
  */
 export function autoLoginDecision(
@@ -1373,25 +1438,37 @@ export function autoLoginDecision(
     if (isAutoLoginOptedOut(env)) return "opted-out"
     if (looksHeadless(env, platform)) return "headless"
     if (readAutoLoginMarker({ now })) return "in-progress"
-    const at = readState().auto_login_at
-    if (Number.isFinite(at) && now - at < AUTO_LOGIN_EVERY_MS) return "recent"
+    const state = readState()
+    if (autoLoginRanRecently(state, now)) return "recent"
+    if (autoLoginHeldUntil(state, now)) return "held"
     return "due"
 }
 
 /**
- * Stamp the daily cadence and forget the previous attempt's error. Called
- * the moment the authorize URL exists — just BEFORE the browser is
- * launched — so a crash after the tab opened cannot re-open one next
- * session, while an attempt that never reached the sign-in server (no
- * URL, no tab) leaves the cadence alone and may be retried at the next
- * session start.
+ * Stamp the daily cadence and forget the previous attempt's error and
+ * hold. Called the moment the authorize URL exists — just BEFORE the
+ * browser is launched — so a crash after the tab opened cannot re-open one
+ * next session, while an attempt that never reached the sign-in server
+ * (no URL, no tab) leaves the cadence alone.
  */
 export function markAutoLoginStarted(now = Date.now()) {
-    updateState({ auto_login_at: now, auto_login_error: null })
+    updateState({ auto_login_at: now, auto_login_error: null, auto_login_hold_until: null })
 }
 
-export function markAutoLoginFailed(message, now = Date.now()) {
-    updateState({ auto_login_error: String(message ?? "unknown").slice(0, 200), auto_login_error_at: now })
+/**
+ * Record why the attempt failed. `hadUrl` says whether a link ever existed:
+ * an attempt that opened a tab is paced by the daily cadence it stamped;
+ * one that never got that far (sign-in server unreachable, discovery
+ * failed, the helper could not start) is HELD for AUTO_LOGIN_HOLD_MS —
+ * retrying at every session start would cost each one a wait and a line
+ * about a browser that is not going to open.
+ */
+export function markAutoLoginFailed(message, now = Date.now(), { hadUrl = false } = {}) {
+    updateState({
+        auto_login_error: String(message ?? "unknown").slice(0, 200),
+        auto_login_error_at: now,
+        ...(hadUrl ? {} : { auto_login_hold_until: now + AUTO_LOGIN_HOLD_MS }),
+    })
 }
 
 /**
@@ -1422,11 +1499,13 @@ export function beginBackgroundLogin({
     })
     const urlTimer = setTimeout(() => resolveUrl(null), urlTimeoutMs)
     urlTimer.unref?.()
+    let hadUrl = false
     const done = loginWithBrowser({
         ...loginOpts,
         timeoutMs,
         now,
         onAuthorizeUrl: (value) => {
+            hadUrl = true
             markAutoLoginStarted(now())
             if (owned) publishAutoLoginUrl(value, { now: now() })
             resolveUrl(value)
@@ -1434,7 +1513,7 @@ export function beginBackgroundLogin({
     })
         .then((result) => ({ ok: true, ...result }))
         .catch((error) => {
-            markAutoLoginFailed(error?.message ?? error, now())
+            markAutoLoginFailed(error?.message ?? error, now(), { hadUrl })
             return { ok: false, error: error?.message ?? String(error) }
         })
         .finally(() => {
@@ -1452,16 +1531,23 @@ export function beginBackgroundLogin({
  * {ok:true, sibling:true, email…} when auth.json appears, {ok:false,
  * sibling:true} when the sibling's marker is gone or stale without one,
  * or after the flow's own lifetime — it never outlives a real attempt.
+ *
+ * A marker that does not parse yet is judged the way the claim judged it
+ * (siblingIsLive): fresh = the winner is still writing it, keep polling;
+ * only once it parses as stale, vanishes, or outlives the torn-read grace
+ * is the sibling gone. Without that, a claim lost to a half-written
+ * marker gave up on the very first poll — no link, no outcome.
  */
 function followSiblingLogin({ urlTimeoutMs, timeoutMs, now, sleep }) {
     const startedAt = now()
     const url = (async () => {
         const deadline = startedAt + urlTimeoutMs
         for (;;) {
-            const marker = readAutoLoginMarker({ now: now() })
-            if (!marker) return null
-            if (marker.url) return marker.url
-            if (now() >= deadline) return null
+            const at = now()
+            const marker = readAutoLoginMarker({ now: at })
+            if (marker?.url) return marker.url
+            if (!marker && !markerBeingWritten(at)) return null
+            if (at >= deadline) return null
             await sleep(AUTO_LOGIN_POLL_MS)
         }
     })()
@@ -1478,7 +1564,7 @@ function followSiblingLogin({ urlTimeoutMs, timeoutMs, now, sleep }) {
                     hasRefreshToken: Boolean(auth.refresh_token),
                 }
             }
-            if (!readAutoLoginMarker({ now: now() })) {
+            if (!siblingIsLive(now())) {
                 return {
                     ok: false,
                     sibling: true,
@@ -1500,11 +1586,21 @@ function followSiblingLogin({ urlTimeoutMs, timeoutMs, now, sleep }) {
 
 /**
  * Hook path: start a DETACHED `login.mjs --auto` process and wait briefly
- * for the authorize URL it publishes. Resolves {started, url}; `url` is
- * null when the child had not reached the IdP yet (slow discovery) — the
- * browser MAY still open from the child, which stamps the daily cadence
- * itself the moment it has the link (nothing is stamped here: an attempt
- * that never gets a link may be retried next session). Never throws.
+ * for the authorize URL it publishes. Resolves {started, url, ended?,
+ * failed?}:
+ *   - `url` set: the link, the child is opening the browser;
+ *   - `url` null, no `ended`: the child had not reached the IdP when the
+ *     wait ran out (slow discovery) — the browser MAY still open from the
+ *     child, which stamps the daily cadence itself the moment it has the
+ *     link (nothing is stamped here);
+ *   - `ended`: the child is already gone without a link — the wait is cut
+ *     short the moment that is known (its exit, its recorded failure, its
+ *     marker come and gone) instead of sitting out the full budget.
+ *     `failed` = it recorded a failure (an unreachable IdP: the child has
+ *     put the automatic sign-in on hold) or died abnormally (recorded
+ *     here, same hold); otherwise it simply found nothing to do (signed in
+ *     or claimed by a sibling in the meantime).
+ * Never throws.
  */
 export async function spawnAutoLogin({
     waitMs = AUTO_LOGIN_URL_WAIT_MS,
@@ -1513,28 +1609,44 @@ export async function spawnAutoLogin({
     scriptPath = fileURLToPath(new URL("../login.mjs", import.meta.url)),
     spawnImpl = spawn,
 } = {}) {
-    let child
+    const startedAt = now()
+    let exit = null // {code, signal} once the child is gone — read only while we wait
     try {
-        child = spawnImpl(process.execPath, [scriptPath, "--auto"], {
+        const child = spawnImpl(process.execPath, [scriptPath, "--auto"], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
             env: process.env,
         })
         child.once?.("error", (error) => debug("auto-login child failed to start:", error?.message))
+        child.once?.("exit", (code, signal) => {
+            exit = { code, signal }
+        })
         child.unref?.()
     } catch (error) {
         debug("auto-login spawn failed:", error?.message)
         markAutoLoginFailed(`could not start the sign-in helper: ${error?.message}`, now())
         return { started: false, url: null }
     }
-    const deadline = now() + waitMs
-    while (now() < deadline) {
-        const marker = readAutoLoginMarker({ now: now() })
+    const deadline = startedAt + waitMs
+    let seen = false
+    for (;;) {
+        const at = now()
+        const marker = readAutoLoginMarker({ now: at })
         if (marker?.url) return { started: true, url: marker.url }
+        if (marker) seen = true
+        const failedAt = readState().auto_login_error_at
+        const failed = Number.isFinite(failedAt) && failedAt >= startedAt
+        if (exit || failed || (seen && !marker)) {
+            const died = exit !== null && exit.code !== 0
+            if (died && !failed) {
+                markAutoLoginFailed(`the sign-in helper exited (${exit.signal ?? `code ${exit.code}`})`, at)
+            }
+            return { started: true, url: null, ended: true, failed: failed || died }
+        }
+        if (at >= deadline) return { started: true, url: null }
         await sleep(AUTO_LOGIN_POLL_MS)
     }
-    return { started: true, url: null }
 }
 
 // ---------------------------------------------------------------- status
@@ -1559,11 +1671,14 @@ export function describeAuthStatus({ now = Date.now() } = {}) {
             lines.push("Automatic sign-in: a browser sign-in is open right now — finish it there.")
         } else if (state.auto_login_error) {
             // The cadence is stamped only once a link existed: an attempt
-            // that never reached the sign-in server is retried at the next
-            // session start, one whose tab opened waits a day.
-            const retry = Number.isFinite(state.auto_login_at)
+            // whose tab opened waits a day, one that never reached the
+            // sign-in server is held for a while (AUTO_LOGIN_HOLD_MS).
+            const heldUntil = autoLoginHeldUntil(state, now)
+            const retry = autoLoginRanRecently(state, now)
                 ? "it retries tomorrow"
-                : "it retries at the next session start"
+                : heldUntil
+                  ? `it retries after ${new Date(heldUntil).toISOString()}`
+                  : "it retries at the next session start"
             lines.push(`Automatic sign-in: the last attempt failed (${state.auto_login_error}); ${retry}, or run /ciwg-login now.`)
         } else if (Number.isFinite(state.auto_login_at)) {
             const until = new Date(state.auto_login_at + AUTO_LOGIN_EVERY_MS).toISOString()
