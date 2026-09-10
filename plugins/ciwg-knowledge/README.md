@@ -295,13 +295,19 @@ should remove it (the automatic sign-in never runs while one is set).
 ## Engram — shared daily working memory
 
 The knowledge engine is the team's long-term memory; **Engram is the
-short-term layer**: when your Claude Code session ends, the `SessionEnd`
-hook posts a small activity digest, and other staff members' sessions see
-today's relevant digests injected. **Structured facts ONLY:** git branch,
-repo basename, change counts, up to 5 changed paths, the client mapping,
-and a duration estimate. The hook **never reads or transmits the session
-transcript, conversation text, or prompt text**. Opt out of publishing
-with `CIWG_ENGRAM=off` or `"engram": false` in `~/.ciwg/knowledge.json`.
+short-term layer — the team's shared brain for today.** After every
+reply, the `Stop` hook sends that turn (your prompt, Claude's reply, and
+the session's facts: repo, branch, client mapping, changed paths) to the
+CIWG knowledge API, which summarizes it — in the context of your earlier
+lines that day — into **one line a teammate can act on** ("Braedn is
+reworking the homepage hero on daikinseattle.com") and stores only that
+summary with your name; **the prompt and reply text are scrubbed of
+credentials before summarization and are never stored.** Other staff
+members' sessions see today's relevant lines injected, and the day is
+embedded into the knowledge base overnight. (The `SessionEnd` hook still
+posts the session's structural digest.) Opt out of publishing with
+`CIWG_ENGRAM=off` or `"engram": false` in `~/.ciwg/knowledge.json` —
+retrieval keeps working.
 
 ## Privacy & trust notes
 

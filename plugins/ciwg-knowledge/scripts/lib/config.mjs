@@ -207,6 +207,23 @@ export function isEngramOptedOut() {
  * POST /api/v1/engram/activities — publish one STRUCTURED activity digest
  * (structured facts only; the server whitelists keys and clamps lengths).
  */
+/**
+ * The team memory's write path (Stop hook): one turn — prompt, reply and
+ * the session's facts — for the server to summarize in the context of the
+ * author's day and keep as one activity line. The raw text is not stored.
+ */
+export async function postEngramTurn(turn, opts = {}) {
+    return apiRequest(
+        `${API_BASE}/api/v1/engram/turns`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(turn),
+        },
+        opts
+    )
+}
+
 export async function postEngramActivity(digest, opts = {}) {
     return apiRequest(
         `${API_BASE}/api/v1/engram/activities`,
