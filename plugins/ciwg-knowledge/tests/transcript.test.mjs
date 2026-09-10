@@ -44,7 +44,9 @@ test("readTail drops the partial first line and lastTurnFromFile is null for a m
     const body = [user("x".repeat(3000)), user("the prompt"), assistant("the reply")].join("\n") + "\n"
     writeFileSync(path, body)
     const tail = readTail(path, 200)
-    assert.ok(!tail.startsWith("{"), "a mid-line start is dropped")
+    // The cut fell inside the first (3000-char) line: that fragment is dropped, the rest are whole lines.
+    assert.ok(!tail.includes("xxxx"), "a mid-line start is dropped")
+    assert.ok(tail.startsWith("{"))
     assert.deepEqual(lastTurn(tail), { prompt: "the prompt", reply: "the reply" })
     assert.deepEqual(lastTurnFromFile(path), { prompt: "the prompt", reply: "the reply" })
     assert.equal(lastTurnFromFile(join(dir, "missing.jsonl")), null)

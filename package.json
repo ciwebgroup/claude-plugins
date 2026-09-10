@@ -1,6 +1,6 @@
 {
     "name": "@ciwebgroup/claude-plugins",
-    "version": "0.3.4",
+    "version": "0.3.5",
     "private": true,
     "description": "CI Web Group's Claude plugins — zero-dependency; `npm run package` builds the downloadable zips.",
     "type": "module",
@@ -8,7 +8,7 @@
         "node": ">=18"
     },
     "scripts": {
-        "test": "node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs plugins/ciwg-knowledge/tests/autologin.test.mjs plugins/ciwg-knowledge/tests/package.test.mjs",
+        "test": "node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs plugins/ciwg-knowledge/tests/autologin.test.mjs plugins/ciwg-knowledge/tests/package.test.mjs plugins/ciwg-knowledge/tests/transcript.test.mjs plugins/ciwg-knowledge/tests/update.test.mjs",
         "package": "node tools/package.mjs",
         "validate": "claude plugin validate plugins/ciwg-knowledge"
     }
