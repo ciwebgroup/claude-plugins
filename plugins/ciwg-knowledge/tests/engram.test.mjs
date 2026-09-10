@@ -38,7 +38,7 @@ const {
     postEngramActivity,
     postInject,
 } = await import("../scripts/lib/config.mjs")
-const { buildEngramDigest, collectGitFacts, detectRepoName } = await import(
+const { buildEngramDigest, collectGitFacts, detectBranch, detectRepoName } = await import(
     "../scripts/lib/engram.mjs"
 )
 
@@ -90,6 +90,12 @@ test("detectRepoName: git toplevel basename, null outside a repo", () => {
     assert.equal(detectRepoName(repoDir), "acme-hvac")
     assert.equal(detectRepoName(plainDir), null)
     assert.equal(detectRepoName(undefined), null)
+})
+
+test("detectBranch: the branch, null outside a repo or on a spent budget", () => {
+    assert.equal(detectBranch(repoDir), "checkout-fix")
+    assert.equal(detectBranch(plainDir), null)
+    assert.equal(detectBranch(repoDir, { deadline: Date.now() + 1_000 }), null)
 })
 
 test("collectGitFacts: branch, status counts, top paths, shortstat", () => {

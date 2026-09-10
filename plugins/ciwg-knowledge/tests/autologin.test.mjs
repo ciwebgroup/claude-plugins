@@ -806,7 +806,7 @@ test("MCP server: a tool call without a sign-in opens the browser sign-in and an
     const server = startServer()
     try {
         const init = await server.call("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test" } })
-        assert.equal(init.result.serverInfo.version, "0.3.6", "version comes from plugin.json")
+        assert.equal(init.result.serverInfo.version, "0.3.7", "version comes from plugin.json")
         assert.match(init.result.instructions, /search_company_knowledge/)
         const list = await server.call("tools/list", {})
         assert.deepEqual(list.result.tools.map((t) => t.name), ["search_company_knowledge", "get_source_artifacts"])
