@@ -1,6 +1,6 @@
 {
     "name": "ciwg-knowledge",
-    "version": "0.3.7",
+    "version": "0.3.8",
     "description": "CIWG company knowledge for Claude. Hooks fetch relevant meetings/tickets/chat/notes from the knowledge API BEFORE the model sees your prompt — no tool calls, no retrieval reasoning. Signs you in with CIWG SSO automatically on first use (browser opens once); /ciwg-login is the manual fallback. MCP tools + a company-knowledge skill for explicit deep dives, on the same sign-in.",
     "author": {
         "name": "CI Web Group"

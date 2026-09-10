@@ -1,6 +1,6 @@
 {
     "name": "@ciwebgroup/claude-plugins",
-    "version": "0.3.7",
+    "version": "0.3.8",
     "private": true,
     "description": "CI Web Group's Claude plugins — zero-dependency; `npm run package` builds the downloadable zips.",
     "type": "module",
