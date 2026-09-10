@@ -1,6 +1,6 @@
 # Test, package, and publish the plugin zips as a GitHub Release.
 #
-# Every push and PR runs the tests and builds the packages (uploaded as a
+# Pushes to main and every PR run the tests and build the packages (uploaded as a
 # workflow artifact for review). On main, when plugin.json carries a
 # version that has no release yet, a release tagged
 # ciwg-knowledge-v<version> is created with:
@@ -9,15 +9,15 @@
 #                                          chat unverified — see the README)
 #   release.json, SHA256SUMS
 # The repo is public: the assets are plain download links, and the synapse
-# "AI Tools" page points straight at them (web-services looks the release
-# up via GET /api/v1/knowledge/plugin-package/info; its streaming proxy is
-# only for a private repo). Bump the version in
+# "AI Tools" page points straight at them (web-services with ci-connect
+# #796 or later looks the release up via /api/v1/knowledge/plugin-package/info;
+# its streaming proxy is only for a private repo). Bump the version in
 # plugins/ciwg-knowledge/.claude-plugin/plugin.json to cut a release.
 #
 # Least privilege: the test job runs PR code (npm test executes whatever the
 # branch contains) with a READ-ONLY token and no persisted git credentials;
-# only the release job — main pushes, never a pull_request — gets
-# contents:write, and one release run at a time.
+# only the release job — main pushes or a manual dispatch on main, never a
+# pull_request — gets contents:write, and one release run at a time.
 name: Release
 
 on:

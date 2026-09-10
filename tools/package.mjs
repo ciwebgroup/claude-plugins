@@ -35,7 +35,8 @@
  * Plus release.json (version + sha256 per asset, the surfaces each asset
  * is documented for, and the "verify on first upload" note) and
  * SHA256SUMS, so a marketplace `archive` source can pin the digests and
- * the synapse download proxy can show the version.
+ * the synapse AI Tools page can show the version (it reads the GitHub
+ * release; the streaming proxy is the private-repo path only).
  *
  * Deterministic: sorted entries, fixed timestamps, directory records
  * (tools/lib/zip.mjs) — rebuilding the same commit ON THE SAME NODE MAJOR

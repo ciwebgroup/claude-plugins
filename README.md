@@ -4,8 +4,8 @@ CI Web Group's Claude plugins. The repository is public so that each
 release's zips are plain download links — the synapse **AI Tools** page
 points staff straight at them (no marketplace, no GitHub account). The
 plugins themselves are inert without a CIWG SSO sign-in: the only
-identifier in here is the public OAuth client id, and every knowledge
-request is checked against Authentik membership on the server.
+credential-shaped value in here is the public OAuth client id, and every
+knowledge request is checked against Authentik membership on the server.
 
 ## Plugins
 
