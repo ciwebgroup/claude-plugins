@@ -57,6 +57,7 @@ import {
     resolveCredential,
 } from "./lib/config.mjs"
 import { detectBranch, detectRepoName } from "./lib/engram.mjs"
+import { clientFacts } from "./lib/clientPaths.mjs"
 import { remainingMs } from "./lib/paths.mjs"
 import { readState, updateState } from "./lib/state.mjs"
 import { spawn } from "node:child_process"
@@ -176,7 +177,10 @@ try {
                 branch,
                 organizationId: mapping?.organizationId ?? null,
                 clientName: mapping?.clientName ?? null,
-                paths: [],
+                // Inside a hydra-sites checkout only: client files touched this
+                // session and the folder name, so the server knows the client
+                // without anyone naming it. Elsewhere these are empty.
+                ...clientFacts(payload.session_id, payload.cwd),
             },
         },
         { deadline }
