@@ -81,7 +81,7 @@ function pruneOldSessions(now) {
 export const folderName = (cwd) => (typeof cwd === "string" && cwd ? basename(cwd) : null)
 
 export const SITE_REPO = "hydra-sites"
-const MAX_WALK_UP = 8
+const MAX_WALK_UP = 16
 
 /**
  * The hydra-sites checkout (or worktree) containing `dir`, or null. Marked by
