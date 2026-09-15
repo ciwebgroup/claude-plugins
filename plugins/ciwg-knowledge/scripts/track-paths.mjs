@@ -14,7 +14,7 @@ try {
     const payload = JSON.parse(await readStdin())
     const input = payload.tool_input ?? {}
     const filePath = input.file_path ?? input.notebook_path ?? null
-    if (rememberClientPath(payload.session_id, filePath)) debug("remembered client path for session")
+    if (rememberClientPath(payload.session_id, filePath, payload.cwd)) debug("remembered client path for session")
 } catch (error) {
     debug("track-paths error:", error?.message)
 }

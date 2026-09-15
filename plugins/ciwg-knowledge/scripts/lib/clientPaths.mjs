@@ -10,8 +10,8 @@
  * "overrides/goldstarplumbingaz/"), never the full path or any other file.
  */
 
-import { mkdirSync, readdirSync, statSync } from "node:fs"
-import { basename, join } from "node:path"
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import { ciwgDir, ensureCiwgDir, readJson, rmQuiet, writeJsonAtomic } from "./paths.mjs"
 
 export const MAX_PATHS = 10
@@ -45,10 +45,15 @@ export function recentClientPaths(sessionId) {
     return Array.isArray(saved?.paths) ? saved.paths.filter((p) => typeof p === "string").slice(0, MAX_PATHS) : []
 }
 
-/** Remember a touched file when it belongs to a client. Never throws. */
-export function rememberClientPath(sessionId, filePath, now = Date.now()) {
+/**
+ * Remember a touched file when it is a client file inside a hydra-sites
+ * checkout. `cwd` resolves a relative path. Never throws.
+ */
+export function rememberClientPath(sessionId, filePath, cwd, now = Date.now()) {
     const fragment = clientShapedPath(filePath)
     if (!sessionId || !fragment) return false
+    const absolute = isAbsolute(filePath) ? filePath : typeof cwd === "string" ? join(cwd, filePath) : null
+    if (!absolute || !hydraSitesRoot(dirname(absolute))) return false
     try {
         ensureCiwgDir()
         mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 })
@@ -74,3 +79,30 @@ function pruneOldSessions(now) {
 
 /** The working folder's name: hydra-sites worktrees are named for the client. */
 export const folderName = (cwd) => (typeof cwd === "string" && cwd ? basename(cwd) : null)
+
+export const SITE_REPO = "hydra-sites"
+const MAX_WALK_UP = 8
+
+/**
+ * The hydra-sites checkout (or worktree) containing `dir`, or null. Marked by
+ * its own files, not its folder name: worktrees are named after branches.
+ * Outside hydra-sites, a folder called overrides/ or a branch name is not
+ * evidence of a client, so nothing is recorded or sent.
+ */
+export function hydraSitesRoot(dir) {
+    if (typeof dir !== "string" || !dir) return null
+    let current = dir
+    for (let i = 0; i < MAX_WALK_UP; i++) {
+        if (existsSync(join(current, "core-policy.json")) && existsSync(join(current, "clients", "_schema.json"))) return current
+        const parent = dirname(current)
+        if (parent === current) return null
+        current = parent
+    }
+    return null
+}
+
+/** Client facts for the inject call: only inside a hydra-sites checkout. */
+export function clientFacts(sessionId, cwd) {
+    if (!hydraSitesRoot(cwd)) return { siteRepo: null, paths: [], folder: null }
+    return { siteRepo: SITE_REPO, paths: recentClientPaths(sessionId), folder: folderName(cwd) }
+}
