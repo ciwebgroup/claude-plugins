@@ -31,6 +31,7 @@ import {
     readStdin,
 } from "./lib/config.mjs"
 import { detectBranch, detectRepoName } from "./lib/engram.mjs"
+import { folderName, recentClientPaths } from "./lib/clientPaths.mjs"
 
 /** Below this the server would not look anyway — save the round trip. */
 const MIN_PROMPT_CHARS = 15
@@ -68,7 +69,10 @@ try {
                 branch,
                 organizationId: mapping?.organizationId ?? null,
                 clientName: mapping?.clientName ?? null,
-                paths: [],
+                // Client-shaped files touched this session, and the folder name:
+                // how the server knows the client without anyone naming it.
+                paths: recentClientPaths(payload.session_id),
+                folder: folderName(payload.cwd),
             },
         },
         { deadline }
