@@ -8,8 +8,8 @@
         "node": ">=18"
     },
     "scripts": {
-        "test": "node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs plugins/ciwg-knowledge/tests/autologin.test.mjs plugins/ciwg-knowledge/tests/package.test.mjs plugins/ciwg-knowledge/tests/transcript.test.mjs plugins/ciwg-knowledge/tests/update.test.mjs plugins/ciwg-knowledge/tests/clientPaths.test.mjs",
+        "test": "node --test plugins/ciwg-knowledge/tests/engram.test.mjs plugins/ciwg-knowledge/tests/auth.test.mjs plugins/ciwg-knowledge/tests/autologin.test.mjs plugins/ciwg-knowledge/tests/package.test.mjs plugins/ciwg-knowledge/tests/transcript.test.mjs plugins/ciwg-knowledge/tests/update.test.mjs plugins/ciwg-knowledge/tests/clientPaths.test.mjs plugins/hbis-outreach/tests/no-client-data.test.mjs",
         "package": "node tools/package.mjs",
-        "validate": "claude plugin validate plugins/ciwg-knowledge"
+        "validate": "claude plugin validate plugins/ciwg-knowledge && claude plugin validate plugins/hbis-outreach && claude plugin validate ."
     }
 }

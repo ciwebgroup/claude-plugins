@@ -9,6 +9,11 @@
             "name": "ciwg-knowledge",
             "source": "./plugins/ciwg-knowledge",
             "description": "Company knowledge auto-injection: relevant call transcripts, chat logs and Fathom meetings (tickets/team-chat/notes as their ingestion ships) flow into Claude's context automatically — retrieval happens in hooks, outside the model, with zero tool-call overhead. Signs you in with CIWG SSO automatically on first use (no tokens; /ciwg-login is the manual fallback). Includes explicit MCP search tools and a company-knowledge skill on the same sign-in."
+        },
+        {
+            "name": "hbis-outreach",
+            "source": "./plugins/hbis-outreach",
+            "description": "HBIS outreach for Hydra clients: drafts the brief request and the follow-up chase in each client's Slack channel (email when they are not in Slack yet), checks the Hydra Production Tracker first, and logs every send to Asana. Draft-only — nothing reaches a client until the person running it sends it."
         }
     ]
 }
