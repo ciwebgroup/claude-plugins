@@ -1,0 +1,10 @@
+{
+    "name": "hbis-outreach",
+    "version": "1.0.0",
+    "description": "Draft HBIS brief requests and follow-up chases to Hydra clients in Slack (email when they are not in Slack yet): resolves each client's channel and edition, checks the Hydra Production Tracker, renders the approved copy, and logs every send back to Asana. Never sends on its own — the operator reads and sends every message. Needs the Slack, Asana and Gmail connectors.",
+    "author": {
+        "name": "CI Web Group"
+    },
+    "homepage": "https://github.com/ciwebgroup/claude-plugins/tree/main/plugins/hbis-outreach",
+    "repository": "https://github.com/ciwebgroup/claude-plugins"
+}
