@@ -178,8 +178,9 @@ unless they say otherwise, and drop anyone whose `HBIS` is already `Requested`/`
 ## Step 1 — Resolve the batch
 
 ```bash
+export HYDRA_SITES_REPO="/path/to/your/hydra-sites"   # optional, see below
 python3 "<skill dir>/resolve.py" plan --probe \
-  --slugs slug1,slug2,slug3 | column -t -s$'\t'
+  --slugs slug1=domain1.com,slug2=domain2.net | column -t -s$'\t'
 ```
 
 This prints one row per client: client name, suggested edition, the direct
@@ -187,6 +188,16 @@ prompt URL, a confidence, and the description the guess came from. It reads
 `clients/<slug>.json` when the client has one, and with `--probe` falls back to
 the client's live website when they don't — **most HBIS recipients have no
 config yet**, which is precisely why they are being asked for a brief.
+
+`--repo` / `$HYDRA_SITES_REPO` points at your own hydra-sites checkout. There is
+no default path; when it is unset, the config lookup is skipped and every row
+comes from `--probe`.
+
+**Give `--probe` the real domain.** The tracker task name is the client's
+domain, so pass `slug=<that domain>`. A bare slug makes the script probe
+`<slug>.com`, which is only a guess. Slugs drop hyphens and many clients are on
+.net or .biz. The row then says "GUESSED domain", and you must say so to the
+operator rather than presenting the result as the client's site.
 
 **Do not trust the `confidence: high` rows blindly.** Read the description
 column yourself and confirm the edition matches the business. The regex is a
@@ -206,6 +217,28 @@ Fall back to `hosting-<slug>`, then `slack_search_channels`. Channel names do
 not always equal client slugs. **Never guess a channel ID** — an unresolved
 client is reported to the operator, not approximated. A message in the wrong
 client's channel is the worst failure mode this skill has.
+
+**Never name a channel to a client from the slug either** (Kimberly,
+2026-10-01). One client was emailed a `#client-…` name that did not exist; the
+real channel had been renamed to `hosting-…` a year earlier. Their search came
+back empty, they tried to create a workspace, hit Slack's paywall, and
+escalated. Copy the exact name from the search result. A client who mentions a
+Slack paywall is almost always trying to _create_ a workspace, not join ours:
+guests are free, so lead with that.
+
+**A client can have two channels a letter apart.** Search on the **brand
+word**, not the full slug, so near-duplicates surface. The one matching the
+domain can be the one the client was never in, while their brief sat untagged
+in the other for a week. Break the tie with `slack_list_channel_members`: the
+real channel is the one **the client** is in. Staff are in both, so their
+membership proves nothing. Flag the duplicate to the operator; do not fix
+membership yourself.
+
+**For a sweep across dozens of clients**, page `slack_list_user_channels`
+(`format: "full"`, `limit: 200`) once and match slugs locally instead of
+searching per slug. It takes a handful of calls, and you can only match names
+that exist. `client-` is the usual prefix, `hosting-` is common, and a bare
+slug is rare.
 
 ## Step 2b — Read the channel before rendering (do not skip)
 
@@ -269,7 +302,34 @@ never read and the deadline quietly expires.
 
 Look for a member who is **external** (the read shows
 `(external: <their workspace>)` on their join line) or who matches the contact
-name from Step 2b.
+name from Step 2b. Odd numeric usernames are contractor accounts, not the
+client.
+
+**"Invited" and "accepted the invite" are not "joined."** A colleague's
+"sent Slack invites" post records an invite, not a join. In one month, three
+clients were logged as having accepted on a call, and none of them ever
+appeared in the channel. **Check access before you draft, not after**
+(Kimberly, 2026-10-07). For any message that mentions Slack access, run all
+three checks first:
+
+1. `slack_list_channel_members` with deleted users and bots included;
+2. `slack_search_users` on the client's email address;
+3. `slack_search_users` on the client's first name.
+
+If none finds them, the invite never completed. Say so in the plan. Never
+write "we've just sent a fresh invite" unless the operator has actually resent
+it. Two invites with no join is an escalation to whoever manages Slack invites
+(an approval step on our side may be holding them). It is not a reason to
+re-send the same instruction.
+
+**A channel with no invite trail at all is itself a finding** (Kimberly,
+2026-10-01). One client had been asked for weeks to post into a channel they
+had never been offered a way into. Say so and get the invite sent; do not just
+repeat the ask.
+
+**A client who insists they already posted it** may have posted in their own
+company's Slack workspace. Check membership before you re-ask, and do not
+assume they are stalling.
 
 **Harvest their Slack user ID while you are here — this is required.** Channel
 reads render mentions as `<@U0AAAAAAAAA|Pat Smith>`; the `U…` half is the ID.
@@ -596,6 +656,21 @@ Not-started: an incomplete brief does not enter the queue. In-progress:
 whatever they leave blank, we keep guessing at, and they will see the guesses
 in the result. Both framings live in the templates — keep them in any rewrite.
 
+**The HBIS is a markdown file the client builds with their own AI. It is never
+a "form" or a "questionnaire"** (Kimberly, 2026-10-07). Calling it a form
+misstates the process to clients and to leadership. In any copy you write, say
+"build your brief with AI" or "your HBIS markdown file". For a client who finds
+it heavy, say "still getting comfortable with AI", never "would rather not
+fill out a long form".
+
+**Client change requests go into the brief** (Kimberly, 2026-10-07). When a
+client who still owes their HBIS sends site feedback or change requests, do
+not promise fixes one by one and do not route them to a designer. The goal is
+the brief, and every item will be handled through it. List their items as
+things to tell their AI when they run the prompt, then re-ask for the fully
+filled-out brief with the prompt and example links. Answer a factual question
+directly only if the brief cannot capture it.
+
 ## Follow-ups (scheduled chase)
 
 Keep a roster at `~/.claude/hbis-outreach/roster.json` for the batch in
@@ -641,6 +716,21 @@ first run of a batch from the Step 1 tracker query, in this shape:
   is engagement, not silence, and it changes the nudge.
 - `search_threads` with `from:<their email>` for an emailed reply — contacts
   who are not in Slack will answer by email.
+- **`slack_read_thread` on our last message.** `slack_read_channel` returns
+  only top-level messages, so a client who answered **in a thread** looks
+  exactly like silence. On 2026-10-07 two channel reads showed our message as
+  the newest thing, while the client had replied twice in its thread. A
+  `reply_count` on the parent in a `detailed` read is the tell. When you do
+  reply, pass `thread_ts` so the conversation stays where the client put it.
+
+**Count the ladder in messages the client could actually receive** (Kimberly,
+2026-10-01). A Slack post into a channel the client is not in is not a rung.
+For a client who is not a member, the first **email** is the request, however
+many Slack posts came before it. Before calling anything chase #2, rebuild the
+ladder from the client's side: check membership for every Slack message and
+the thread for every email. Chase numbers advance only on messages confirmed
+sent. A client was once left out of a past-due batch as "already chased" when
+they had never had a single follow-up they could see.
 
 **Never nudge a client who delivered, replied, or asked a question you have
 not answered.** Chasing someone who already responded is worse than not
@@ -697,6 +787,41 @@ client's responsibility, and a client who will not send it is choosing their
 own place in the queue. Report who is outstanding and how long their build has
 been waiting; propose nothing beyond that.
 
+**Two weeks with no usable brief → a reconstructed brief, not more chasing.**
+Leadership direction, 2026-10-05. A client asked two or more weeks ago with no
+usable brief gets one built for them from their live website, their Google
+Business Profile and what we already hold (the Asana story feed, Slack, Gmail,
+any partial file they sent).
+
+- **Who qualifies:** includes clients who _replied_ but never delivered.
+  Filtering on "haven't heard back" missed about half the group.
+- **Hold anyone actively mid-brief**, including anyone with a meeting or call
+  booked with their AM. Read the last 48 hours of the Asana story feed for a
+  meeting or commitment before writing, and again before logging. One client
+  was moved on two days before their AM's booked call and had to be reverted.
+  The operator makes the call on holds.
+- **Order:** higher plan first, then the original request date.
+- **Where it goes:** `overrides/<slug>/.onboarding/hbis/HBIS-Hydra-Site-Brief.md`
+  in hydra-sites. Resolve the slug with `git ls-tree origin/stage clients/`,
+  never from a local listing or a name match. Look-alike slugs can belong to
+  different businesses.
+- **No invention:** every fact carries a source tag. The client's own words
+  outrank GBP, which outranks the site. Gaps become
+  `[Missing — confirm with client]` questions.
+- A brief the client sends later supersedes the reconstruction.
+- **For a client overwhelmed by the AI step** (Kimberly, 2026-10-07): offer to
+  skip the prompt, not the questions. We already hold most of the brief, so
+  they answer the reconstruction's open questions in Slack: short answers, any
+  order, build-blockers first. Never word it as skipping questions.
+
+**Where this flow ends** (Kimberly, 2026-10-06): the job is to get the
+completed brief into the viber's hands. Build and QA findings that turn up
+while reading a brief (a content parity audit, an unverified claim, content
+that should not ship as written) belong to the viber. Flag them once, in an
+Asana build-notes comment that @-mentions the viber, and do not carry them as
+open items. The only items this flow keeps open are outstanding client answers
+and the assets the brief flags as missing.
+
 ## The example brief — `example-brief.md`
 
 Clients have no idea what a good HBIS looks like. The templates tell them to
@@ -738,6 +863,19 @@ anything. `/hbis` links it twice as well.
 
 So the attachment step is gone: a client gets a URL, not a file.
 
+**The example is for feeding to their AI, not just for reading** (Kimberly,
+2026-10-01). The client gives `example.md` to their AI **in the same
+conversation as the prompt**, as a model of the finished product: "match this
+depth and structure for my business." The first pass then comes back far
+closer to usable. `/hbis/example` is a rendered page with a "Download the
+example (.md)" button at the top. The `.md` URLs (the example and every
+`prompt-<edition>.md`) **download** rather than display, so a client who
+clicks one gets a file in Downloads and may think nothing happened. When a
+client asks how to view the example, point them to that button and lead with
+_use it_: download both files and give both to their AI. Do not send them
+through a text editor to copy and paste, and do not assume their AI can fetch
+a URL.
+
 **No copy of the brief ships with this skill** — it is ~137KB and it already
 lives in this repo. **The hosted page is canonical.** The source is
 `overrides/ciwebgroup/content/hbis/example-brief.md` in hydra-sites: edit
@@ -759,6 +897,50 @@ own sentences, conflicts recorded rather than smoothed over, and blocking gaps c
 blocking. A brief that reads like it could belong to any company in that trade is
 a brief to go back on, and the example is how you show that without arguing
 about it.
+
+## Intake checks — answered is not the same as complete
+
+Run these on every returned brief, before reading it closely.
+
+1. **Word count against the example** (~13,800 words). One brief answered
+   every question at about 24% of the example's length, and the whole
+   shortfall was the client-specific half.
+2. **Grep for "Reconstructed" or "Recovery status".** Either means the
+   client's AI lost the session and rebuilt answers from its own suggestions.
+   Those answers are permission, not information: they say what we may build,
+   not what is true about the company. In that brief, five sections committed
+   the site to real job photos and reviews while supplying none.
+3. **Check every client-specific ask by its artifact, not its keywords**
+   (Kimberly, 2026-10-06). Before reading, name what the ask should have
+   produced: a route in the site map, a row in the service catalog, or an
+   explicit decision in the gaps section. Then look for that. One client asked
+   for a second-language page plan, and the brief came back with a dozen
+   mentions of the language, all about bilingual staff, with zero routes and
+   no gap logged. The client's AI folds a specific ask into the nearest theme
+   and reports itself complete. Absent and unlogged is the failure; absent with
+   a recorded decision is fine.
+4. **Ask "who is 'we'?"** (Kimberly, 2026-10-07). Trade briefs default to "our
+   technicians", and a sole operator will not volunteer otherwise. One brief
+   said "our technicians" throughout, and the owner, asked directly, said he
+   worked alone and his office was his home. When the answer is one person:
+   no team or crew language and no multi-tech stock imagery; owner-operated is
+   positioned as the advantage; schema implies no employees; any published
+   response-time window is softened; and a home base means no street address
+   anywhere (copy, schema, footer, metadata), only the service area. Tell the
+   client you are doing this. Treat the admission as nothing to apologise for.
+5. **If the brief arrives as a filled-in PDF**, a page count is meaningless,
+   because most of the file is our template. Run `pdftohtml -xml -i -q` (from
+   poppler). Each text span carries a font, and each font a colour. The client
+   types in a different colour from the template, so count the client-coloured
+   words under each question heading. That gives blank, near-blank and
+   substantive answers per question. Check the colours in every file rather
+   than assuming one. Use `pdftotext -layout` for readable prose.
+
+In the reply, credit the real half _specifically_ so the client knows it was
+read. Name the missing half as **what we would otherwise be assuming**, not as
+a failing. Never say the build is held up when the brief is in. The honest
+lever is that answers given during the build shape it, and the same answers
+afterwards become retrofits.
 
 ## Notes
 
