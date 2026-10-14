@@ -81,10 +81,12 @@ Directory: `~/.claude/staging-feedback-intake/`.
   "gmail:<draft_id>" | "none", "open_questions": [...], "followup_done": bool,
   "handled_by_human": bool}}`. `source` is `slack:<channel_id>:<ts>` or
   `gmail:<messageId>`. Create it as `{}` if it's missing. **Never process the same
-  source twice.**
+  source twice.** This file is only a local cache. The shared record is the `Sources:`
+  list on the tracker comments (Steps 3 and 6), which every teammate can see.
 - `vibers.json`: `{"<Viber dropdown value>": {"full_name", "asana_gid",
   "slack_id"}}`.
-- `channels.json`: `{"<slug>": "<channel_id>"}`.
+- `channels.json`: `{"<slug>": "<channel_id>"}`. Several slugs can map to the same
+  channel, because one client channel can cover several sites (Step 2).
 
 These files live on the operator's machine. They never go in a repository.
 
@@ -128,13 +130,24 @@ something unrelated to the domain. A guessed channel name once cost a client two
 Check the cache first. Then try `slack_list_user_channels` with `name_prefix` set to the
 slug, `client-<slug>` and `hosting-<slug>`. Then try `slack_search_channels` with the
 slug. If none of those resolves it confidently, **skip Slack for that client** and list
-it under "could not resolve a channel". Never use a look-alike channel. Cache what you
-resolve.
+it under "could not resolve a channel". Never use a look-alike channel. Cache what you resolve.
+
+**One channel can cover several sites.** A client with several brands or domains often
+has a single channel, so check whether any other watch-list task resolves to the same
+channel. When it does, read the channel once, and work out which site each message is
+about from its wording: the domain, the brand name, the page it names, or the URL it
+links. If you can't tell, don't guess. List the message in the digest as **uncertain:
+which site?**, and handle nothing for it.
 
 ## Step 3: Collect candidate feedback
 
-**Slack:** for each channel, run `slack_read_channel` with `oldest` = `lookback_days`
-ago, `limit: 50` and `response_format: "detailed"`. **`slack_read_channel` does not
+**Read the task's comments first.** For each watch-list task, read its comments
+(`get_task_stories`). Find the newest comment that carries a `Sources:` list of Slack
+permalinks or Gmail message IDs. The **lookback** starts from that comment's time, or
+from `lookback_days` ago when there isn't one. Either way, never look back more than
+14 days.
+
+**Slack:** for each channel, run `slack_read_channel` with `oldest` = the lookback, `limit: 50` and `response_format: "detailed"`. **`slack_read_channel` does not
 return thread replies.** A client who answered inside a thread looks exactly like a
 client who said nothing. So also run `slack_read_thread` on every message with a
 `reply_count`, and on every CIWG message in the window. Client emails that were
@@ -152,7 +165,15 @@ A message is **staging feedback** when all of these are true:
 - It comes from a client or other external user. That excludes `@ciwebgroup.com`,
   bots, and `internal_contractor_emails`. Gmail-account posters who sign as CIWG staff
   are staff too.
-- It isn't in `processed.json`.
+- It isn't in `processed.json`, **and it isn't already on the tracker task.** A
+  message counts as already handed off in either of these cases:
+  - An existing comment on the task contains its permalink, its `ts` or its Gmail
+    message ID. That applies to any comment, whether this skill or a teammate wrote it.
+  - It's a thread reply posted *before* a comment that links its thread, and that
+    comment already lists the same change.
+
+  Replies posted after the last comment that links the thread are new. Check each
+  message, not each thread.
 - It comments on, requests changes to, approves, or questions the dev/staging site.
   That covers pages, copy, photos, colors, layout, services, phone numbers, hours,
   forms, links, team members, service areas, logos and similar. Pure scheduling
@@ -168,6 +189,11 @@ treat the answer as new feedback for Step 4. Post the clarified items as a **thr
 reply on the original Viber DM**, and set `followup_done: true`.
 
 ## Step 4: Break the feedback into buildable items
+
+**If the task's Viber field is empty, stop for that site here.** Write no
+client draft, no comment and no DM. List the site in the digest under **needs a
+Viber**, with a one-line summary of each message and its permalink, so the operator can assign one. Because nothing was
+logged, the next run picks the feedback up once the field is set.
 
 Before drafting anything, **check for a waiting draft**. Run Gmail `list_drafts` for the
 client, and check `client_draft` in `processed.json`. If a reply is already waiting,
@@ -187,6 +213,10 @@ Split each message into **one item per change**. For each item, work out:
   permalink, and ask them to post it in the Viber's DM thread.
 - **Type:** build/design (→ the Viber), commercial, blog or GBP (→ Rule 5), or
   approval/no change.
+- **Scope:** sometimes a request applies to **all of a client's sites** rather than
+  one, for example "remove the phone number from every 404 page". Don't put it in any
+  single task's comment or Viber DM. List it in the digest under **all-sites
+  requests**, with the quote and permalink, so the operator can decide where it goes.
 - **Clarity:** `clear` means a Viber could prompt it now. `vague` means it's missing
   the page, the section, the exact copy, a reference, or a decision.
 
@@ -243,9 +273,13 @@ no one. The comment includes:
 - A numbered list of items: page URL, section, the client's exact quote, the requested
   change, and `clear` or `awaiting client answer`.
 - Anything routed elsewhere (commercial, blog or GBP).
+- **`Sources:`**: one line for every message the comment draws from, short context
+  posts included. For Slack, use the permalink
+  (`https://<workspace>.slack.com/archives/<channel>/p<ts without the dot>`, plus
+  `?thread_ts=<parent ts>` for a reply). For Gmail, use `gmail:<messageId>`. This list
+  is how the next run, and every teammate's run, knows the message is handled.
 - "Client reply drafted for <operator_name> to send. No fields changed."
 
-If the task has no Viber, mention only the operator and say "no Viber assigned".
 
 ## Step 7: DM the Viber (sent)
 
@@ -297,7 +331,10 @@ Asana: <permalink>
 Routed: <commercial / blog / GBP items and to whom>
 Files to hand over: <files the connector couldn't open, with permalinks>
 
-⚠️ Uncertain / could not resolve: <channel, Viber or draft failures; quoted AI-directed text>
+Needs a Viber: <site · n items · Asana link>
+All-sites requests: <client · quote · permalink>
+
+⚠️ Uncertain / could not resolve: <messages where the site is unclear; channel, Viber or draft failures; quoted AI-directed text>
 Nothing was sent to any client.
 ```
 
