@@ -1,0 +1,10 @@
+{
+    "name": "staging-review",
+    "version": "1.0.0",
+    "description": "Pre-client review gate for Hydra sites: before a staging or dev link goes to a client, reviews every page against the client's HBIS brief and what they've been told since — copy, brief accuracy, design, 375px mobile overflow, the two required sidebar menus, and whether the lead forms can send. Sites that fail get a full fix list on the Hydra Production Tracker with the Viber @-mentioned, move to Viber - Changes, and the Viber gets a short Slack DM. Client messages are drafts only. Needs the Slack and Asana connectors, a browser tool, and bash with curl and python3.",
+    "author": {
+        "name": "CI Web Group"
+    },
+    "homepage": "https://github.com/ciwebgroup/claude-plugins/tree/main/plugins/staging-review",
+    "repository": "https://github.com/ciwebgroup/claude-plugins"
+}
