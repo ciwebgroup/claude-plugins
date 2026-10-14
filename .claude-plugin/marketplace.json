@@ -19,6 +19,11 @@
             "name": "staging-feedback-intake",
             "source": "./plugins/staging-feedback-intake",
             "description": "Client staging-site feedback for Account Managers: a twice-daily sweep of Slack and Gmail over your own Hydra projects that drafts the client reply with clarifying questions, logs the request on the tracker with the Viber tagged, and DMs the Viber a prompt-ready brief. Draft-only — nothing reaches a client until you send it."
+        },
+        {
+            "name": "staging-review",
+            "source": "./plugins/staging-review",
+            "description": "Pre-client review gate for Hydra sites: reviews every staging page against the client's HBIS brief — copy, brief accuracy, design, 375px mobile, the two sidebar menus, and whether the lead forms can send — then posts a verified fix list on the tracker, moves the task to Viber - Changes and drafts the Viber's DM. Draft-only — nothing reaches a client until you send it."
         }
     ]
 }
