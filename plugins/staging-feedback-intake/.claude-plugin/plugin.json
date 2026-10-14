@@ -1,0 +1,10 @@
+{
+    "name": "staging-feedback-intake",
+    "version": "1.0.0",
+    "description": "Twice-daily sweep of Slack and Gmail for client feedback on their Hydra dev/staging site, scoped to the running Account Manager's own projects. Drafts a client reply with clarifying questions, logs the request on the Hydra Production Tracker with the Viber @-mentioned, and DMs the Viber a prompt-ready brief. Client messages are drafts only — the operator sends them. Needs the Slack, Asana and Gmail connectors.",
+    "author": {
+        "name": "CI Web Group"
+    },
+    "homepage": "https://github.com/ciwebgroup/claude-plugins/tree/main/plugins/staging-feedback-intake",
+    "repository": "https://github.com/ciwebgroup/claude-plugins"
+}
