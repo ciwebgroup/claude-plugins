@@ -14,6 +14,11 @@
             "name": "hbis-outreach",
             "source": "./plugins/hbis-outreach",
             "description": "HBIS outreach for Hydra clients: drafts the brief request and the follow-up chase in each client's Slack channel (email when they are not in Slack yet), checks the Hydra Production Tracker first, and logs every send to Asana. Draft-only — nothing reaches a client until the person running it sends it."
+        },
+        {
+            "name": "staging-feedback-intake",
+            "source": "./plugins/staging-feedback-intake",
+            "description": "Client staging-site feedback for Account Managers: a twice-daily sweep of Slack and Gmail over your own Hydra projects that drafts the client reply with clarifying questions, logs the request on the tracker with the Viber tagged, and DMs the Viber a prompt-ready brief. Draft-only — nothing reaches a client until you send it."
         }
     ]
 }
