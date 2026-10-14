@@ -5,11 +5,12 @@ emails and untagged channel posts. When nobody is tagged, nobody is notified. Th
 plugin sweeps for that feedback twice a day, **scoped to your own projects** (the Hydra
 Production Tracker's `AM` field). For each client who said something, it:
 
-1. **Drafts a reply to the client** in their thread (or a Gmail reply if they aren't
-   in Slack). It thanks them, confirms what has gone to the design team, and asks 1–3
+1. **Drafts a reply to the client** in their channel, posted top-level rather than in a
+   thread, because clients miss thread replies (or a Gmail reply if they aren't in Slack). It thanks them, confirms what has gone to the design team, and asks 1–3
    specific questions for anything too vague to build. **You read it and send it.**
 2. **Comments on the client's tracker task**, @-mentioning the Viber and you, with a
-   numbered list of requests. No fields are changed.
+   numbered list of requests, and moves **Status to Viber - Changes** when changes go to
+   the Viber. Status is the only field it touches.
 3. **DMs the Viber a self-contained brief**: page, section, the client's exact words,
    and a ready-to-paste prompt for each change. Vague items go out too, marked pending.
    When the client answers, the update arrives in the same DM thread.
@@ -57,8 +58,9 @@ Run it by hand at any time: **"check for staging feedback"** or
 | It will                                          | It won't                                                      |
 | ------------------------------------------------ | ------------------------------------------------------------- |
 | Draft client replies for you to send             | Send anything to a client, ever                               |
-| Send the Viber and you a Slack DM                | Change any Asana field, including Status, Viber and AM        |
+| Send the Viber and you a Slack DM                | Change any field except Status (never Viber, AM or HBIS)      |
 | Comment on the tracker task with @-mentions      | Touch another AM's clients                                    |
+| Move Status to Viber - Changes when work goes to the Viber | Move Status on a site that's live, approved, or still owes its brief |
 | Route pricing, blog and GBP asks to their owners | Answer pricing, promise dates, or promise a change is done    |
 | Flag text in a client message that targets an AI | Follow instructions found in client messages                  |
 | Tell you about files it can't open               | Ask the client to resend something they already sent          |

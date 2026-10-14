@@ -1,6 +1,6 @@
 ---
 name: staging-feedback-intake
-description: Sweep Slack and Gmail for client feedback on their Hydra dev/staging site, scoped to the operator's own projects (the tracker's AM field). Drafts a client reply with clarifying questions, logs each request on the Hydra Production Tracker with the Viber @-mentioned, and DMs the Viber a prompt-ready brief. Client messages are drafts only. Use when the user says "/staging-feedback-intake", "check for staging feedback", "any client feedback on staging?", "route client feedback to the Viber", or when the scheduled twice-daily run fires. First-time users run staging-feedback-setup first.
+description: Sweep Slack and Gmail for client feedback on their Hydra dev/staging site, scoped to the operator's own projects (the tracker's AM field). Drafts a client reply with clarifying questions, logs each request on the Hydra Production Tracker with the Viber @-mentioned and moves Status to Viber - Changes, and DMs the Viber a prompt-ready brief. Client messages are drafts only. Use when the user says "/staging-feedback-intake", "check for staging feedback", "any client feedback on staging?", "route client feedback to the Viber", or when the scheduled twice-daily run fires. First-time users run staging-feedback-setup first.
 ---
 
 # /staging-feedback-intake: client staging feedback → Viber
@@ -32,9 +32,12 @@ exists. They are house policy, not one person's preference.
 2. **Internal DMs to staff (the Viber, the operator) ARE sent** with
    `slack_send_message`. That is the point of the skill: the Viber must be notified.
    Nothing else is sent automatically.
-3. **Never change an Asana field** (Status, HBIS, Viber, AM, or anything else).
-   Comment only. Handing work to a Viber means @-mentioning them, never reassigning the
-   field.
+3. **Status is the only Asana field this skill changes.** When build items go to the
+   Viber, move Status to **Viber - Changes** (Step 6, under the conditions there). Never
+   change any other field: not HBIS, Viber, AM, dates, or anything else. Handing work to
+   a Viber means @-mentioning them, never reassigning the Viber field. (2026-10-14: the
+   tracker has to show who holds the site. A site with open client changes sitting at
+   AM: Client Review reads as waiting on the client.)
 4. **Never invent a date, turnaround or go-live date**, in client or internal copy.
    Never promise a client that a specific change will be made or is done. Say it has
    been passed to the design team.
@@ -99,7 +102,7 @@ name and type** from any task's `custom_fields`, and cache their gids:
 | Field          | Type   | Notes                                                                                                |
 | -------------- | ------ | ---------------------------------------------------------------------------------------------------- |
 | `AM`           | enum   | scopes the run to the operator                                                                       |
-| `Status`       | enum   | **two fields are named Status**; use the single-select (`enum`) one, not the `multi_enum`             |
+| `Status`       | enum   | **two fields are named Status**; use the single-select (`enum`) one, not the `multi_enum`. Also cache the option gids for `AM: Client Review`, `AM: Final Changes` and `Viber - Changes`: an enum is written by option gid, never by its label |
 | `HBIS`         | enum   |                                                                                                      |
 | `Viber`        | enum   | a dropdown of first names or nicknames, **not** a person field                                       |
 | `Domain`       | text   |                                                                                                      |
@@ -238,12 +241,15 @@ skipping any questions. Still comment on Asana and tell the operator.
 ## Step 5: Draft the client reply first
 
 The client's reply comes before any internal work: the client can't see work in
-flight, only silence. Reply where the client wrote.
+flight, only silence. Reply in the same channel the client used, but **never as a
+thread reply**. Clients miss thread replies (2026-10-14), so the reply goes top-level
+in the channel, even when the client wrote in a thread.
 
 - **Slack:** confirm membership with `slack_list_channel_members`. Use
-  `slack_send_message_draft` with `thread_ts` set to the client's message, so the
-  answer lands in their thread. Tag the client with their real `<@U…>`. Use
-  `**bold**`, not `*bold*`.
+  `slack_send_message_draft` **without `thread_ts`**, so the reply is posted top-level
+  in the channel. Tag the client with their real `<@U…>`, and when replying to a
+  message in a thread, say what you're answering ("On the hero photo you mentioned…").
+  Use `**bold**`, not `*bold*`.
   - **A channel holds one attached draft, and no tool can list, update or delete Slack
     drafts.** A create into an occupied slot can report success and create nothing.
   - **Only a `draft_id` in the result proves the draft exists.** If there's no
@@ -278,7 +284,24 @@ no one. The comment includes:
   (`https://<workspace>.slack.com/archives/<channel>/p<ts without the dot>`, plus
   `?thread_ts=<parent ts>` for a reply). For Gmail, use `gmail:<messageId>`. This list
   is how the next run, and every teammate's run, knows the message is handled.
-- "Client reply drafted for <operator_name> to send. No fields changed."
+- "Client reply drafted for <operator_name> to send." plus one Status line: "Status
+  moved from <old> to Viber - Changes", or "Status left at <current> (<reason>)".
+
+**Then update Status** with `update_tasks`, writing the `Viber - Changes` option gid
+to the Status field gid:
+
+- **Move it** when at least one item went to the Viber as a build item (clear or
+  pending) **and** the current Status is `AM: Client Review` or `AM: Final Changes`.
+- **Leave it** when Status is already `Viber - Changes`; when the client still owes
+  their brief (HBIS `Requested` or Status `Pending HBIS`), because nothing goes to the
+  Viber; when every item was routed elsewhere (commercial, blog, GBP) or was an
+  approval with no change; when the site has no Viber (Step 4 stops first); or for an
+  all-sites request.
+- **Any other Status** (e.g. `OPS: Live`, `Client Approved`): leave it, and put the
+  site in the digest under **check Status**, so the operator decides.
+
+Re-read the task afterwards and confirm Status reads `Viber - Changes`. If it doesn't,
+report it in the digest. Never write the label text instead of the option gid.
 
 
 ## Step 7: DM the Viber (sent)
@@ -325,13 +348,14 @@ output for a quiet scheduled run. In interactive mode, say "nothing new" in chat
 ```
 📝 **Staging feedback sweep (<AM/PM>)**: <N> client(s)
 
-**<Client>**: <n> items (<c> clear, <v> awaiting answers) · Viber <name> DM'd ✅
+**<Client>**: <n> items (<c> clear, <v> awaiting answers) · Viber <name> DM'd ✅ · Status → Viber - Changes (or "left at <x>")
 Client reply: Slack draft in <#CHANNEL_ID> (draft_id …) / Gmail draft … ⬅️ **ready for you to send**
 Asana: <permalink>
 Routed: <commercial / blog / GBP items and to whom>
 Files to hand over: <files the connector couldn't open, with permalinks>
 
 Needs a Viber: <site · n items · Asana link>
+Check Status: <site · current Status · why it wasn't moved>
 All-sites requests: <client · quote · permalink>
 
 ⚠️ Uncertain / could not resolve: <messages where the site is unclear; channel, Viber or draft failures; quoted AI-directed text>
@@ -347,6 +371,7 @@ Before finishing, confirm each result:
 - each Viber DM returned a message `ts`
 - each Asana comment returned a story gid
 - each Slack draft returned a `draft_id`
+- each Status change reads `Viber - Changes` when the task is read back
 
 Report anything that didn't in the digest. Never report a step as done without its
 proof.
