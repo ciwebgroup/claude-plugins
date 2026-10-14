@@ -18,7 +18,7 @@
         {
             "name": "staging-feedback-intake",
             "source": "./plugins/staging-feedback-intake",
-            "description": "Client staging-site feedback for Account Managers: a twice-daily sweep of Slack and Gmail over your own Hydra projects that drafts the client reply with clarifying questions, logs the request on the tracker with the Viber tagged, and DMs the Viber a prompt-ready brief. Draft-only — nothing reaches a client until you send it."
+            "description": "Client staging-site feedback for Account Managers: a twice-daily sweep of Slack and Gmail over your own Hydra projects that drafts the client reply with clarifying questions, logs the request on the tracker with the Viber tagged and moves Status to Viber - Changes, and DMs the Viber a prompt-ready brief. Draft-only — nothing reaches a client until you send it."
         },
         {
             "name": "staging-review",
