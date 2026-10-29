@@ -30,31 +30,41 @@ are ready for client review", "is examplehvac ready for the client?") or run
 
 | check | how |
 | --- | --- |
-| Brief accuracy: services, licences, phones, prices, warranty, staff, claims | background review agent with the brief + every post-brief decision |
+| Brief accuracy: services, licences, phones, prices, warranty, staff, claims | background review agent with the brief, the live site's claims + every post-brief decision |
+| **Removed services creeping back** (rebuilds start from legacy content + trade templates) | channel/helpdesk history of removal requests, checked against page text and `<title>`s |
 | Spelling, grammar, capitalization, template bugs | the same agent, across every page |
 | Code defects: broken images and links, old-domain links, canonicals, schema | the same agent, plus `curl` |
 | **Lead forms can send** (`window.__PMS_CONFIG__` present) | `scripts/crawl.sh` |
+| **Lead forms can be read** (override `globals.css` has the forms `@source`) | file check + contrast/axe run with the page scrolled and reveals forced visible |
 | **375px mobile overflow** on every page | `scripts/mobile-scan.js` in the browser |
 | **Sidebar menus**: Service Areas + services in this city | `scripts/sidebar.py` |
+| **Placement**: homepage, mega menu, sitemap HTML + XML, parent sidebar, final URLs only | crawl + astro-island props |
+| **Town in the page**: H1, meta title and description name the town | the review agent |
 | Visual: hero rendering, header controls, clipped badges | screenshots |
 
-Every agent claim is checked against the brief and the live page before it's posted.
+Every agent claim is checked against the brief, the live site and the staging page before
+it's posted. Each finding is sorted into **blocks the link** (broken or unreadable forms,
+invented facts, wrong contact details, removed items back, placeholders) or **doesn't block**
+(soft claims the client never confirmed go to the client to confirm; tracking gaps carry to
+QA-01). A claim the client's live site already makes is not an invented fact.
 
 ## What it does with a fail
 
-1. Posts the full fix list on the tracker task, with the Viber @-mentioned.
+1. Posts the full fix list on the tracker task, with the Viber @-mentioned. Asana is the
+   only place the fix list goes; there is no Slack DM brief.
 2. Moves Status to **Viber - Changes**.
-3. Drafts a short Slack DM to the Viber.
+3. If you want a nudge, drafts a one-line "check Asana" pointer for you to send.
 4. If the client already has the link: recommends a two-line heads-up to the client, drafted
    top-level in their channel.
 5. After you send, logs every message on the task with permalinks, and sets Last Client
-   Contact and the next follow-up.
+   Contact (the send date) and Next Follow-Up Due (two business days on, unless the client
+   named a timeline) without asking.
 
 ## The gate: it never messages a client
 
 Every client message is a **draft** you read and send. Client replies go **top-level in the
-channel, never in a thread**, because clients miss thread replies. Internal DMs to a Viber are
-drafted too, unless you tell it to send.
+channel, never in a thread**, because clients miss thread replies. Client drafts offer the
+decision where the client's judgement is in play, and never promise the old site's look.
 
 ## Your working files live outside the plugin
 

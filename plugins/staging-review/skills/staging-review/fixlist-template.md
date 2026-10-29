@@ -11,15 +11,19 @@ Checked against: <brief file> + <post-brief decisions: who, when>.
 ## Visible to the client now
 <only if the client already has the link>
 
-## Against the brief
+## Against the brief / removed services
 1. **<short label>.** <exact site quote> (<page(s), count>). <What the brief says>. <What to do.>
 
-## Needs the client's OK (hold or soften)
-- <claims that may be true but aren't confirmed: name what to ask>
+## Client to confirm (not blocking — goes in the client's review message)
+- <soft claims the client never confirmed, and placeholder content that needs their facts>
 
 ## Sidebar menus
 - Service Areas: <present on X of Y city pages; shows A of B areas>
 - Services in this city: <present on X of Y; examples of pages missing it>
+
+## Placement + town
+- <pages missing from homepage / mega menu / sitemap HTML+XML / parent sidebar; links via 301 or to drafts>
+- <service-in-city / service-area pages whose H1, meta title or description lack the town>
 
 ## Mobile
 - <page> overflows at 375px (<width>px): <offending element>. <All other pages fine.>
@@ -29,3 +33,6 @@ Checked against: <brief file> + <post-brief decisions: who, when>.
 
 ## Technical
 - <canonicals, old-domain links, hot-linked images, duplicates, schema>
+
+## Carry to QA-01 (not blocking)
+- <call tracking, GA4 key events, legacy GA tag findings>
