@@ -26,6 +26,12 @@ Inputs:
   * <every post-brief decision, with the client's own words where useful>
   * <everything the client was told is fixed or removed>
   * <never-publish rules: address, prices, warranty, staff, licences, services held>
+  * <every service or claim the client ever asked to remove, incl. old helpdesk tickets>
+- Brief author: <client | CIWG-reconstructed>. Claims the client's LIVE site visibly makes:
+  <list>. A live-site claim is NOT an invented fact unless the client's own words contradict
+  it; a reconstructed brief's "do not publish" does not count as the client's words.
+- Soft, unconfirmed marketing claims ("anytime", "within the hour", "Licensed & Insured")
+  are Low / "client to confirm", not High.
 - Already known (do not re-report; just note "known"): <items the operator already found>
 
 Do three things:
@@ -33,7 +39,11 @@ Do three things:
    services offered vs held or excluded; licences; phone numbers per location; hours;
    pricing, financing and warranty; years in business; team size and named staff;
    certifications, awards and dealer status; guarantees; response-time and 24/7 promises;
-   service areas; review counts; address and privacy; invented stats; generic boilerplate.
+   service areas; review counts; address and privacy; invented stats; generic boilerplate;
+   removed services that came back (check page <title>s and the /services index too);
+   generic trade boilerplate that doesn't fit this client (residential framing on a
+   commercial client, templated city names); service-in-city, service-area and hub pages
+   whose H1 / meta title / meta description don't name the town.
    Give the brief quote vs the site quote, the page, and severity (High / Med / Low).
 2. SPELLING / GRAMMAR / CAPITALIZATION / PUNCTUATION: misspellings, brand-name variants,
    place names, broken sentences, doubled words, template bugs ("Services services",

@@ -23,7 +23,7 @@
         {
             "name": "staging-review",
             "source": "./plugins/staging-review",
-            "description": "Pre-client review gate for Hydra sites: reviews every staging page against the client's HBIS brief — copy, brief accuracy, design, 375px mobile, the two sidebar menus, and whether the lead forms can send — then posts a verified fix list on the tracker, moves the task to Viber - Changes and drafts the Viber's DM. Draft-only — nothing reaches a client until you send it."
+            "description": "Pre-client review gate for Hydra sites: reviews every staging page against the client's HBIS brief and live site — copy, brief accuracy, removed services, design, 375px mobile, the two sidebar menus, page placement, and whether the lead forms can send and be read — then posts a verified fix list on the tracker and moves the task to Viber - Changes. Draft-only — nothing reaches a client until you send it."
         }
     ]
 }
