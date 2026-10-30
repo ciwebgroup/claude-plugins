@@ -2,7 +2,12 @@
 """Resolve HBIS outreach rows: slug -> client name, edition, prompt URL, message.
 
 Usage:
-  resolve.py plan  --slugs a,b,c [--due "Fri Oct 3"] [--repo PATH]
+  resolve.py plan  --slugs a=a-domain.com,b=b-domain.net [--probe] [--repo PATH]
+
+`--repo` (or $HYDRA_SITES_REPO) is the hydra-sites checkout; unset, the
+clients/<slug>.json lookup is skipped. With `--probe`, give each slug its real
+domain as `slug=domain`; a bare slug probes a guessed `<slug>.com` and the
+output says it was a guess.
   resolve.py render --slug a --edition trades --due "Fri Oct 3" \
       --sender "Your Name" --title "Your Title"
 
@@ -134,6 +139,8 @@ def describe(repo, slug):
     config, so a full-JSON match called an HVAC shop a manufacturer and a maid
     service a law firm. These four fields are the ones a human would read.
     """
+    if not repo:
+        return None, None, ""
     path = os.path.join(repo, "clients", f"{slug}.json")
     if not os.path.exists(path):
         return None, None, ""
@@ -155,6 +162,10 @@ def probe_site(slug, domain=None):
     Most HBIS recipients have a Slack channel but no clients/<slug>.json --
     they have not started a Hydra build, which is the whole point of sending
     them the brief. Their current website is the best available signal.
+
+    Pass the real domain (the tracker task name is the client's domain).
+    Without one, `<slug>.com` is only a guess -- slugs drop hyphens, and many
+    clients are on .net/.biz -- so the caller must label the result a guess.
     """
     host = domain or f"{slug}.com"
     for url in (f"https://{host}", f"https://www.{host}"):
@@ -222,10 +233,23 @@ def main():
     ap.add_argument("--channel", default="your project channel",
                     help="Slack channel name, for the email variant's setup prompt")
     ap.add_argument("--probe", action="store_true",
-                    help="for slugs with no config, read the live site for a description")
-    ap.add_argument("--repo", default=os.path.expanduser(
-        "~/Desktop/CIWG Sites/hydra-sites"))
+                    help="for slugs with no config, read the live site for a "
+                         "description. Pass slugs as slug=domain (the tracker "
+                         "task name); a bare slug probes a guessed <slug>.com")
+    # No machine-specific default: every operator keeps hydra-sites somewhere
+    # different. Unset = skip the clients/<slug>.json lookup entirely.
+    ap.add_argument("--repo", default=os.environ.get("HYDRA_SITES_REPO"),
+                    help="hydra-sites checkout (or $HYDRA_SITES_REPO); "
+                         "unset skips the client-config lookup")
     a = ap.parse_args()
+    if a.repo:
+        a.repo = os.path.expanduser(a.repo)
+        if not os.path.isdir(os.path.join(a.repo, "clients")):
+            sys.exit(f"--repo {a.repo} has no clients/ directory; point it at "
+                     f"a hydra-sites checkout, or unset it to skip configs.")
+    elif a.mode == "plan":
+        print("note: no --repo / $HYDRA_SITES_REPO, so client configs are not "
+              "read; names and editions come from --probe only.", file=sys.stderr)
 
     # Any mode that renders client-facing copy must be signed by the operator
     # running it. Fail here, loudly, rather than letting a None reach
@@ -290,8 +314,11 @@ def main():
             if cfg is None and a.probe:
                 desc, host = probe_site(slug, dom)
                 blob = f"{slug} {host} {desc}".lower()
+                src = host if dom else f"{host}, a GUESSED domain"
                 if desc:
-                    name = f"?? CONFIRM ?? (from {host})"
+                    name = f"?? CONFIRM ?? (from {src})"
+                elif not dom:
+                    name = f"?? NO CONFIG ?? ({src} did not answer; pass {slug}=<domain>)"
             key, conf, sig = guess(blob)
             e = eds.get(key, {})
             print("\t".join([slug, name, key or "?", e.get("label", "?? PICK ONE ??"),
@@ -324,8 +351,8 @@ def main():
     # The Gmail connector silently replaces `www.`-prefixed URLs with the
     # literal text "[link removed]" (observed 2026-09-29 on a client batch: the
     # prompt-trades and /hbis/example links both died, the bare-domain /hbis
-    # link survived). Both forms serve 200, and the bare form was chosen
-    # form, so normalise every ciwebgroup URL here -- this also catches the
+    # link survived). Both forms serve 200, and the bare form was chosen, so
+    # normalise every ciwebgroup URL here -- this also catches the
     # EDITION_URL that arrives www-prefixed from the live editions feed.
     tpl = tpl.replace("https://www.ciwebgroup.com/", "https://ciwebgroup.com/")
     left = re.findall(r"\{\{(\w+)\}\}", tpl)
