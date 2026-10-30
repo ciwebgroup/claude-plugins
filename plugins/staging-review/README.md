@@ -12,7 +12,7 @@ lead. This is the shared copy: no client names, domains, Slack IDs or Asana IDs,
 in this public repository.
 
 Claude Code only. It needs the **Slack** and **Asana** connectors, a **browser** tool (the
-built-in browser pane or Claude in Chrome), and bash with `curl` and `python3`.
+built-in browser pane or Claude in Chrome), and bash with `curl` and `python3` (plus `npx` and Chrome for the local Lighthouse fallback).
 
 ## Install (once)
 
@@ -37,6 +37,7 @@ are ready for client review", "is examplehvac ready for the client?") or run
 | **Lead forms can send** (`window.__PMS_CONFIG__` present) | `scripts/crawl.sh` |
 | **Lead forms can be read** (override `globals.css` has the forms `@source`) | file check + contrast/axe run with the page scrolled and reveals forced visible |
 | **375px mobile overflow** on every page | `scripts/mobile-scan.js` in the browser |
+| **Mobile PageSpeed 90+** (LCP ≤ 2.5s, TBT ≤ 200ms, CLS ≤ 0.1) on home + key templates | `scripts/pagespeed.sh`: PSI, falling back to local Lighthouse 12; median of 3 lab runs |
 | **Sidebar menus**: Service Areas + services in this city | `scripts/sidebar.py` |
 | **Placement**: homepage, mega menu, sitemap HTML + XML, parent sidebar, final URLs only | crawl + astro-island props |
 | **Town in the page**: H1, meta title and description name the town | the review agent |
@@ -45,7 +46,8 @@ are ready for client review", "is examplehvac ready for the client?") or run
 Every agent claim is checked against the brief, the live site and the staging page before
 it's posted. Each finding is sorted into **blocks the link** (broken or unreadable forms,
 invented facts, wrong contact details, removed items back, placeholders) or **doesn't block**
-(soft claims the client never confirmed go to the client to confirm; tracking gaps carry to
+(soft claims the client never confirmed go to the client to confirm; a sub-90 PageSpeed score
+is a required Viber fix and a go-live blocker, not a link blocker; tracking gaps carry to
 QA-01). A claim the client's live site already makes is not an invented fact.
 
 ## What it does with a fail
@@ -83,6 +85,8 @@ All read-only against the site: plain `curl` GETs, no form submissions.
 
 - `scripts/crawl.sh <work-dir> <url>`: every sitemap page plus the homepage, as HTML and text,
   and lists pages missing `__PMS_CONFIG__`.
+- `scripts/pagespeed.sh <work-dir> <url> <path>...`: mobile PageSpeed, 3 runs per page, median
+  vs the 90+ bar, with the LCP element named. Set `PAGESPEED_API_KEY` to stay on PSI.
 - `scripts/sidebar.py <work-dir>`: the two-menu check on every city page.
 - `scripts/mobile-scan.js`: pasted into the browser's JavaScript tool; scans every page in a
   375px iframe.
