@@ -1,6 +1,6 @@
 ---
 name: staging-review
-description: Pre-client review gate for Hydra sites. Before any staging/dev link goes to a client, review the whole site against the client's HBIS brief and everything they've been told since — copy (spelling, grammar, capitalization), brief accuracy, removed services creeping back, design defects, 375px mobile overflow, the two required sidebar menus, page placement, and whether the lead forms can actually send and be read. Sites that fail are held, get a full fix list on the Hydra Production Tracker with the Viber @-mentioned, and move to Viber - Changes. Client messages are drafts only. Use when the user says "/staging-review", "review the sites ready for client review", "is <client> ready for the client?", "check staging before we send it", "review <client>'s staging site", or before sending any client a staging or dev link.
+description: Pre-client review gate for Hydra sites. Before any staging/dev link goes to a client, review the whole site against the client's HBIS brief and everything they've been told since — copy (spelling, grammar, capitalization), brief accuracy, removed services creeping back, design defects, 375px mobile overflow, mobile PageSpeed (90+), the two required sidebar menus, page placement, and whether the lead forms can actually send and be read. Sites that fail are held, get a full fix list on the Hydra Production Tracker with the Viber @-mentioned, and move to Viber - Changes. Client messages are drafts only. Use when the user says "/staging-review", "review the sites ready for client review", "is <client> ready for the client?", "check staging before we send it", "review <client>'s staging site", or before sending any client a staging or dev link.
 ---
 
 # /staging-review: review a Hydra site before the client sees it
@@ -79,6 +79,9 @@ person's preference.
   Viber's to-do.
 - Placeholder content that needs the client's own facts (e.g. generic job listings): flag it
   *to the client* as a decision; don't silently remove it.
+- Mobile PageSpeed under 90 (step 6c). The client reviews content, not scores, so a slow site
+  doesn't hold the link — but it goes on the Viber's fix list as a required item, and it has
+  to reach 90+ before go-live.
 - Tracking: missing call tracking/WhatConverts, GA4 key events, the legacy GA tag. These are
   launch-phase (QA-01). Log them on the task as "carry to QA-01"; never call the build
   blocked over them. (WhatConverts' tag is often injected late by WP Rocket, so it isn't
@@ -180,7 +183,8 @@ Run these together:
   look for header buttons pushed off-screen, clipped badges, and a logo that isn't the
   client's. A `200` and a good-looking hero are not a check: read the rendered text and the
   `<title>` too.
-- **Sidebar check** (step 6) and **placement + town check** (step 6b).
+- **Sidebar check** (step 6), **placement + town check** (step 6b) and **PageSpeed** (step 6c,
+  in the background — it takes a few minutes).
 
 ## Step 6 — Sidebar menus (standing check since 2026-10-14)
 
@@ -229,6 +233,42 @@ H1 and meta title, and the meta description and opening paragraph name the town.
 resource pages carry the primary town in the meta title. A bulk title like "X in <Metro> metro"
 on a page for a smaller town in that metro is a fail.
 
+## Step 6c — Mobile PageSpeed (since 2026-10-30)
+
+Leadership re-runs mobile PageSpeed on every go-live, and sites have launched in the 50s and
+60s, with clients spotting slow scores before we did. The standard is **90+ mobile, with LCP
+≤ 2.5s, TBT ≤ 200ms and CLS ≤ 0.1**. Measure it here, before the client has the link, and not
+for the first time after launch.
+
+```bash
+bash scripts/pagespeed.sh <work-dir>/<slug> https://<slug>-stg.ciwebgroup.com \
+  / <one child page> <one service-in-city page> <the heaviest page the visual pass found>
+```
+
+Run it in the background. That's 3 runs per page, and the median is what you report. It
+calls the PageSpeed Insights API and falls back to local Lighthouse 12 (same engine, same mobile
+profile) when PSI refuses the call. Set `PAGESPEED_API_KEY` to stay on PSI. Read `psi/summary.tsv`:
+
+- **Use lab numbers only.** Google's real-user ("field" / Core Web Vitals) numbers cover 28
+  days of the *domain*. On staging there are none, and on a just-migrated domain they mostly
+  measure the old site. Never report them as the Hydra build's score.
+- **One bad run isn't a finding.** PSI runs vary. If the runs spread 15+ points (the notes
+  say so), re-run that page before you report it. A single 9-second LCP that the other runs
+  don't show is noise.
+- **Name the cause, not just the number.** The notes give the LCP element. If it's hero text
+  or a hero image inside an `astro-island`, or behind a `data-reveal`, the hero waits for
+  JavaScript before it paints. The fix is to render it server-side and never hide it above
+  the fold. A high TBT usually comes from third-party scripts (`third-party-summary` in the
+  JSON). Font-swap layout shift is a CSS-only fix.
+- Staging has no GTM or call-tracking scripts yet, so the live site will score a little
+  lower than staging. A staging score just over 90 is a "re-measure after go-live" note under
+  **Carry to QA-01**.
+
+Every page under the bar goes on the fix list under **Performance**: page, median score and the
+failing metrics, the LCP element or the blocking script, and "done when: 90+ mobile median on
+`pagespeed.sh`". If the fix is outside the override (shared shell, core components), say so,
+so the Viber can route it to the platform team rather than hack it locally.
+
 ## Step 7 — Verify, then write the fix list
 
 For each agent report, check the biggest claims (the High items, and anything client-visible)
@@ -238,7 +278,7 @@ the section above. Then write the fix list from `fixlist-template.md`:
 
 - Open with what **passed**. Vibers act faster on a list that credits the work.
 - Order: critical (forms) → visible to the client now → against the brief / removed services
-  → sidebar → placement + town → mobile → copy → technical. Non-blocking soft claims go in
+  → sidebar → placement + town → mobile → performance → copy → technical. Non-blocking soft claims go in
   **Client to confirm**; tracking findings go in **Carry to QA-01**.
 - Quote exactly, give page paths and counts, and say what to do instead. For each item give
   the file or page, the current value, the client's exact wording where it applies, and a
@@ -307,6 +347,7 @@ HBIS** — those are the stages where the ball is with the client.
 
 ## What to say at the end
 
-A table: site | result (pass / held) | top blocker | what was posted. Then list the drafts
+A table: site | result (pass / held) | top blocker | mobile PageSpeed (home median) | what was
+posted. Then list the drafts
 waiting for the operator to send, by draft ID. Then list any decisions only the operator can
 make (policy-breaking live claims, brief-vs-live conflicts, anything held for a client answer).

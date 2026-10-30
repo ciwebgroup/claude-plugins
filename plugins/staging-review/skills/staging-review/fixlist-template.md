@@ -28,6 +28,9 @@ Checked against: <brief file> + <post-brief decisions: who, when>.
 ## Mobile
 - <page> overflows at 375px (<width>px): <offending element>. <All other pages fine.>
 
+## Performance (mobile PageSpeed, median of 3 lab runs; bar is 90+, LCP ≤ 2.5s, TBT ≤ 200ms, CLS ≤ 0.1)
+- <page>: <score> (LCP <s>, TBT <ms>, CLS <n>). Cause: <LCP element / blocking script / font shift>. <Fix.> Done when: 90+ on `pagespeed.sh`.
+
 ## Copy / spelling
 - <grouped, with page counts>
 
@@ -36,3 +39,4 @@ Checked against: <brief file> + <post-brief decisions: who, when>.
 
 ## Carry to QA-01 (not blocking)
 - <call tracking, GA4 key events, legacy GA tag findings>
+- <pages scoring just over 90 on staging: re-measure mobile PageSpeed after go-live, once tracking scripts are on>
